@@ -1,0 +1,2 @@
+# multiseqex
+MULTI SEQuence EXtractor
