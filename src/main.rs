@@ -46,12 +46,12 @@ struct Cli {
     #[arg(long)]
     list: Option<PathBuf>,
 
-    /// CSV/TSV with 3 columns: chr,start,end (header allowed)
+    /// CSV/TSV table with named columns: CHROM + START/END (range mode) or CHROM + POS (position mode, requires --flank). Optional: NAME. Extra columns are ignored.
     /// Delimiter auto-detected from extension: .tsv => tab, else comma
     #[arg(long)]
     table: Option<PathBuf>,
 
-    /// Flank size (only used if table has chr,pos with 2 columns)
+    /// Flank size for position-mode tables (required when using POS or POS_LEFT/POS_RIGHT columns)
     #[arg(long)]
     flank: Option<u64>,
 
@@ -67,7 +67,7 @@ struct Cli {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// CSV/TSV with 4 or 6 columns for SVs: chrom_left, pos_left, chrom_right, pos_right [, start_left, end_left, start_right, end_right]
+    /// CSV/TSV SV table with named columns: CHROM_LEFT + CHROM_RIGHT + START_LEFT/END_LEFT/START_RIGHT/END_RIGHT (range mode) or POS_LEFT/POS_RIGHT (position mode, requires --flank). Optional: NAME. Extra columns are ignored.
     #[arg(long)]
     sv_table: Option<PathBuf>,
 
@@ -446,9 +446,18 @@ fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
     })
 }
 
-/// Parse CSV/TSV table (2 or 3 columns)
-fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = if path
+/// Build a case-insensitive header name -> column index map
+fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (i, h) in headers.iter().enumerate() {
+        map.insert(h.trim().to_uppercase(), i);
+    }
+    map
+}
+
+/// Auto-detect delimiter from file extension (.tsv -> tab, else comma)
+fn detect_delimiter(path: &Path) -> u8 {
+    if path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("tsv"))
@@ -457,334 +466,291 @@ fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
         b'\t'
     } else {
         b','
-    };
+    }
+}
+
+/// Parse a numeric field from a record by column index, with context on error
+fn parse_u64_field(
+    rec: &csv::StringRecord,
+    col_idx: usize,
+    field_name: &str,
+    row: usize,
+) -> Result<u64> {
+    rec.get(col_idx)
+        .ok_or_else(|| anyhow!("Missing {} at row {}", field_name, row))?
+        .trim()
+        .replace(',', "")
+        .parse()
+        .with_context(|| format!("Bad {} at row {}", field_name, row))
+}
+
+/// Parse CSV/TSV table using column names: CHROM, START, END, POS, NAME
+fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
+    let delim = detect_delimiter(path);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
         .from_path(path)
         .with_context(|| format!("Cannot open table: {}", path.display()))?;
-    let headers = rdr.headers().map(|h| h.clone()).ok();
 
-    let mut out = Vec::new();
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
 
-    // Determine mode
-    let mode = {
-        let headers = rdr.headers()?;
-        headers.len()
-    };
+    // Required column
+    let chrom_idx = hmap
+        .get("CHROM")
+        .copied()
+        .ok_or_else(|| anyhow!("Table missing required CHROM column (found: {:?})", headers))?;
 
-    if ![2, 3, 4].contains(&mode) {
-        return Err(anyhow!("Table must have [2,3,4] columns (got {})", mode));
-    } else if ![2, 3].contains(&mode) && flank.is_some() {
-        return Err(anyhow!(
-            "--flank can only be used with 2 or 3-column tables"
-        ));
+    // Detect mode from available columns
+    let has_start = hmap.get("START").copied();
+    let has_end = hmap.get("END").copied();
+    let has_pos = hmap.get("POS").copied();
+    let name_idx = hmap.get("NAME").copied();
+
+    enum TableMode {
+        Range { start_idx: usize, end_idx: usize },
+        Position { pos_idx: usize },
     }
 
-    // Unwrap flank when validation is done
-    let flank = flank.unwrap_or(0);
-
-    let process_record = |rec: csv::StringRecord, idx: usize| -> Result<Region> {
-        match mode {
-            2 => {
-                let chr = rec.get(0).unwrap().trim();
-                let pos: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                let start = pos.saturating_sub(flank);
-                let end = pos + flank;
-                Ok(Region {
-                    name: None,
-                    chr: chr.to_string(),
-                    start,
-                    end,
-                })
-            }
-            3 => {
-                let chr = rec.get(0).unwrap().trim();
-                let start: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                let end: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                Ok(Region {
-                    name: None,
-                    chr: chr.to_string(),
-                    start: min(start, end),
-                    end: max(start, end),
-                })
-            }
-            _ => unreachable!(),
+    let mode = match (has_start, has_end, has_pos) {
+        (Some(s), Some(e), None) => TableMode::Range {
+            start_idx: s,
+            end_idx: e,
+        },
+        (None, None, Some(p)) => TableMode::Position { pos_idx: p },
+        (Some(_), Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "Table has both START/END and POS columns — ambiguous. Use either START+END (range mode) or POS (position mode)."
+            ));
+        }
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err(anyhow!(
+                "Table has only one of START/END — both are required for range mode (found: {:?})",
+                headers
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "Table must have either START+END or POS columns (found: {:?})",
+                headers
+            ));
         }
     };
+
+    // Validate flank usage
+    if let TableMode::Position { .. } = &mode {
+        if flank.is_none() {
+            return Err(anyhow!(
+                "--flank is required when table uses POS column (position mode)"
+            ));
+        }
+    }
+
+    let flank = flank.unwrap_or(0);
+    let mut out = Vec::new();
 
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec?;
-        if rec.len() != mode {
-            return Err(anyhow!(
-                "Row {} has {} columns but expected {}",
-                i + 2,
-                rec.len(),
-                mode
-            ));
-        }
-        out.push(process_record(rec, i + 1)?);
+        let row = i + 2; // 1-based, accounting for header
+
+        let chr = rec
+            .get(chrom_idx)
+            .ok_or_else(|| anyhow!("Missing CHROM at row {}", row))?
+            .trim()
+            .to_string();
+
+        let name = name_idx.and_then(|idx| {
+            rec.get(idx)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+
+        let region = match &mode {
+            TableMode::Range {
+                start_idx,
+                end_idx,
+            } => {
+                let start = parse_u64_field(&rec, *start_idx, "START", row)?;
+                let end = parse_u64_field(&rec, *end_idx, "END", row)?;
+                Region {
+                    name,
+                    chr,
+                    start: min(start, end),
+                    end: max(start, end),
+                }
+            }
+            TableMode::Position { pos_idx } => {
+                let pos = parse_u64_field(&rec, *pos_idx, "POS", row)?;
+                Region {
+                    name,
+                    chr,
+                    start: pos.saturating_sub(flank),
+                    end: pos + flank,
+                }
+            }
+        };
+
+        out.push(region);
     }
 
     Ok(out)
 }
 
+/// Parse SV CSV/TSV table using column names:
+/// CHROM_LEFT, START_LEFT, END_LEFT, POS_LEFT, CHROM_RIGHT, START_RIGHT, END_RIGHT, POS_RIGHT, NAME
 fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("tsv"))
-        .unwrap_or(false)
-    {
-        b'\t'
-    } else {
-        b','
-    };
+    let delim = detect_delimiter(path);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
         .from_path(path)
         .with_context(|| format!("Cannot open SV table: {}", path.display()))?;
-    let headers = rdr.headers().map(|h| h.clone()).ok();
 
-    let mut out = Vec::new();
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
 
-    // Determine mode
-    let mode = {
-        let headers = rdr.headers().context("Failed to read headers")?;
-        headers.len()
-    };
-    if ![4, 5, 6, 7].contains(&mode) {
-        return Err(anyhow!(
-            "SV tables must have [4,5,6,7] columns (got {})",
-            mode
-        ));
+    // Required chromosome columns
+    let chrom_left_idx = hmap.get("CHROM_LEFT").copied().ok_or_else(|| {
+        anyhow!(
+            "SV table missing required CHROM_LEFT column (found: {:?})",
+            headers
+        )
+    })?;
+    let chrom_right_idx = hmap.get("CHROM_RIGHT").copied().ok_or_else(|| {
+        anyhow!(
+            "SV table missing required CHROM_RIGHT column (found: {:?})",
+            headers
+        )
+    })?;
+
+    // Detect mode from available columns
+    let has_start_left = hmap.get("START_LEFT").copied();
+    let has_end_left = hmap.get("END_LEFT").copied();
+    let has_start_right = hmap.get("START_RIGHT").copied();
+    let has_end_right = hmap.get("END_RIGHT").copied();
+    let has_pos_left = hmap.get("POS_LEFT").copied();
+    let has_pos_right = hmap.get("POS_RIGHT").copied();
+    let name_idx = hmap.get("NAME").copied();
+
+    enum SvMode {
+        Range {
+            start_left_idx: usize,
+            end_left_idx: usize,
+            start_right_idx: usize,
+            end_right_idx: usize,
+        },
+        Position {
+            pos_left_idx: usize,
+            pos_right_idx: usize,
+        },
     }
+
+    let mode = match (
+        has_start_left,
+        has_end_left,
+        has_start_right,
+        has_end_right,
+        has_pos_left,
+        has_pos_right,
+    ) {
+        (Some(sl), Some(el), Some(sr), Some(er), _, _) => SvMode::Range {
+            start_left_idx: sl,
+            end_left_idx: el,
+            start_right_idx: sr,
+            end_right_idx: er,
+        },
+        (None, None, None, None, Some(pl), Some(pr)) => SvMode::Position {
+            pos_left_idx: pl,
+            pos_right_idx: pr,
+        },
+        _ => {
+            return Err(anyhow!(
+                "SV table must have either START_LEFT+END_LEFT+START_RIGHT+END_RIGHT (range mode) \
+                 or POS_LEFT+POS_RIGHT (position mode). Found: {:?}",
+                headers
+            ));
+        }
+    };
+
+    if let SvMode::Position { .. } = &mode {
+        if flank.is_none() {
+            return Err(anyhow!(
+                "--flank is required when SV table uses POS_LEFT/POS_RIGHT columns (position mode)"
+            ));
+        }
+    }
+
+    let flank = flank.unwrap_or(0);
+    let mut out = Vec::new();
 
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec?;
-        match mode {
-            4 => {
-                if flank.is_none() {
-                    return Err(anyhow!(
-                        "--flank must be set for 4-column SV tables (row {}: headers {:?})",
-                        i + 2,
-                        headers
-                    ));
-                }
-                // chrom_left, pos_left, chrom_right, pos_right
-                let chr_left = rec.get(0).unwrap().trim();
-                let pos_left: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(2).unwrap().trim();
-                let pos_right: u64 = rec
-                    .get(3)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let flank = flank.unwrap_or(0);
+        let row = i + 2;
+
+        let chr_left = rec
+            .get(chrom_left_idx)
+            .ok_or_else(|| anyhow!("Missing CHROM_LEFT at row {}", row))?
+            .trim()
+            .to_string();
+        let chr_right = rec
+            .get(chrom_right_idx)
+            .ok_or_else(|| anyhow!("Missing CHROM_RIGHT at row {}", row))?
+            .trim()
+            .to_string();
+
+        let name = name_idx.and_then(|idx| {
+            rec.get(idx)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+
+        match &mode {
+            SvMode::Range {
+                start_left_idx,
+                end_left_idx,
+                start_right_idx,
+                end_right_idx,
+            } => {
+                let sl = parse_u64_field(&rec, *start_left_idx, "START_LEFT", row)?;
+                let el = parse_u64_field(&rec, *end_left_idx, "END_LEFT", row)?;
+                let sr = parse_u64_field(&rec, *start_right_idx, "START_RIGHT", row)?;
+                let er = parse_u64_field(&rec, *end_right_idx, "END_RIGHT", row)?;
                 out.push(Region {
-                    name: None,
-                    chr: chr_left.to_string(),
-                    start: pos_left.saturating_sub(flank),
-                    end: pos_left + flank,
+                    name: name.clone(),
+                    chr: chr_left,
+                    start: min(sl, el),
+                    end: max(sl, el),
                 });
                 out.push(Region {
-                    name: None,
-                    chr: chr_right.to_string(),
-                    start: pos_right.saturating_sub(flank),
-                    end: pos_right + flank,
-                });
-            }
-            5 => {
-                // name, chrom_left, pos_left, chrom_right, pos_right
-                if flank.is_none() {
-                    return Err(anyhow!(
-                        "--flank must be set for 5-column SV tables (row {}: headers {:?})",
-                        i + 2,
-                        headers
-                    ));
-                }
-                let name = rec.get(0).unwrap().trim().to_string();
-                let chr_left = rec.get(1).unwrap().trim();
-                let pos_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(3).unwrap().trim();
-                let pos_right: u64 = rec
-                    .get(4)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let flank = flank.unwrap();
-                out.push(Region {
-                    name: Some(name.clone()),
-                    chr: chr_left.to_string(),
-                    start: pos_left.saturating_sub(flank),
-                    end: pos_left + flank,
-                });
-                out.push(Region {
-                    name: Some(name),
-                    chr: chr_right.to_string(),
-                    start: pos_right.saturating_sub(flank),
-                    end: pos_right + flank,
+                    name,
+                    chr: chr_right,
+                    start: min(sr, er),
+                    end: max(sr, er),
                 });
             }
-            6 => {
-                // chrom_left, start_left, end_left, chrom_right, start_right, end_right
-                let chr_left = rec.get(0).unwrap().trim();
-                let start_left: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(3).unwrap().trim();
-                let start_right: u64 = rec
-                    .get(4)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_right: u64 = rec
-                    .get(5)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
+            SvMode::Position {
+                pos_left_idx,
+                pos_right_idx,
+            } => {
+                let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
+                let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
                 out.push(Region {
-                    name: None,
-                    chr: chr_left.to_string(),
-                    start: min(start_left, end_left),
-                    end: max(start_left, end_left),
+                    name: name.clone(),
+                    chr: chr_left,
+                    start: pl.saturating_sub(flank),
+                    end: pl + flank,
                 });
                 out.push(Region {
-                    name: None,
-                    chr: chr_right.to_string(),
-                    start: min(start_right, end_right),
-                    end: max(start_right, end_right),
+                    name,
+                    chr: chr_right,
+                    start: pr.saturating_sub(flank),
+                    end: pr + flank,
                 });
             }
-            7 => {
-                // name, chrom_left, start_left, end_left, chrom_right, start_right, end_right
-                let name = rec.get(0).unwrap().trim().to_string();
-                let chr_left = rec.get(1).unwrap().trim();
-                let start_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_left: u64 = rec
-                    .get(3)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(4).unwrap().trim();
-                let start_right: u64 = rec
-                    .get(5)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_right: u64 = rec
-                    .get(6)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                out.push(Region {
-                    name: Some(name.clone()),
-                    chr: chr_left.to_string(),
-                    start: min(start_left, end_left),
-                    end: max(start_left, end_left),
-                });
-                out.push(Region {
-                    name: Some(name),
-                    chr: chr_right.to_string(),
-                    start: min(start_right, end_right),
-                    end: max(start_right, end_right),
-                });
-            }
-            _ => unreachable!(),
         }
     }
+
     Ok(out)
 }
 
