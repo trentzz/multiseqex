@@ -525,7 +525,7 @@ fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
             }
             TableMode::Position { pos_idx } => {
                 let p = parse_u64_field(&rec, *pos_idx, "POS", row)?;
-                Region { name, chr, start: p.saturating_sub(flank), end: p + flank }
+                Region { name, chr, start: p.saturating_sub(flank).max(1), end: p + flank }
             }
         };
         out.push(region);
@@ -615,8 +615,8 @@ fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>
             SvMode::Position { pos_left_idx, pos_right_idx } => {
                 let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
                 let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
-                out.push(Region { name: name.clone(), chr: chr_left, start: pl.saturating_sub(flank), end: pl + flank });
-                out.push(Region { name, chr: chr_right, start: pr.saturating_sub(flank), end: pr + flank });
+                out.push(Region { name: name.clone(), chr: chr_left, start: pl.saturating_sub(flank).max(1), end: pl + flank });
+                out.push(Region { name, chr: chr_right, start: pr.saturating_sub(flank).max(1), end: pr + flank });
             }
         }
     }
@@ -684,11 +684,12 @@ fn write_sequences(
         .par_iter()
         .map(|r| {
             let seq = extract_region(fasta_path, fai_index, r)?;
+            let header = match &r.name {
+                Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
+                None => format!(">{}:{}-{}", r.chr, r.start, r.end),
+            };
             let fasta_entry = format!(
-                ">{}:{}-{}\n{}\n",
-                r.chr,
-                r.start,
-                r.end,
+                "{header}\n{}\n",
                 wrap_fasta(&seq, 60)
             );
             Ok((r.clone(), fasta_entry))
@@ -723,7 +724,10 @@ fn write_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
     sequences
         .par_iter()
         .try_for_each(|(region, entry)| -> Result<()> {
-            let filename = format!("{}_{}_{}.fa", region.chr, region.start, region.end);
+            let filename = match &region.name {
+                Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
+                None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
+            };
             let mut f = File::create(dir.join(filename))?;
             f.write_all(entry.as_bytes())?;
             Ok(())

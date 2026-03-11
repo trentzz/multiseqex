@@ -22,7 +22,7 @@ cargo test table_csv_range
 tests/
 ├── integration.rs          # Integration tests (CLI-level)
 └── fixtures/
-    ├── test.fa             # Small FASTA (3 contigs: chr1=198bp, chr2=155bp, chr3=71bp)
+    ├── test.fa             # Small FASTA (3 contigs: chr1=204bp, chr2=140bp, chr3=72bp)
     ├── test.fa.fai         # Corresponding FAI index
     ├── regions.txt         # List-file input
     ├── table_range.csv     # CSV table (range mode)

@@ -111,7 +111,7 @@ cp target/release/multiseqex ~/.local/bin/
 
 ### Prerequisites
 
-- Rust 1.60+ and Cargo
+- Rust 1.85+ and Cargo (edition 2024)
 - [samtools](http://www.htslib.org/doc/samtools.html) (optional — for
   pre-building `.fai` indexes)
 

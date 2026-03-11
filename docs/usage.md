@@ -76,8 +76,10 @@ chr2,3500,regionB
 multiseqex ref.fa --table positions.csv --flank 500
 ```
 
-An optional `NAME` column labels the region for output file naming.
-Any additional columns (e.g. `GENE`, `STRAND`) are silently ignored.
+An optional `NAME` column labels the region in FASTA headers (e.g. `>myregion
+chr1:1000-2000`) and is used for filenames with `--output-dir` (e.g.
+`myregion_1000_2000.fa`). Any additional columns (e.g. `GENE`, `STRAND`) are
+silently ignored.
 Column names are **case-insensitive** and can appear in any order.
 
 ### SV table (`--sv-table`)

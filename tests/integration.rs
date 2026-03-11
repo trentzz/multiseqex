@@ -99,8 +99,8 @@ fn table_csv_position_with_flank() {
         .args(["--table", &fixture("table_pos.csv"), "--flank", "5"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(">chr1:5-15"))
-        .stdout(predicate::str::contains(">chr2:5-15"));
+        .stdout(predicate::str::contains(">regionA chr1:5-15"))
+        .stdout(predicate::str::contains(">regionB chr2:5-15"));
 }
 
 #[test]
@@ -122,8 +122,8 @@ fn sv_table_tsv_range() {
         .args(["--sv-table", &fixture("sv_table_range.tsv")])
         .assert()
         .success()
-        .stdout(predicate::str::contains(">chr1:1-10"))
-        .stdout(predicate::str::contains(">chr2:1-10"));
+        .stdout(predicate::str::contains(">SV001 chr1:1-10"))
+        .stdout(predicate::str::contains(">SV001 chr2:1-10"));
 }
 
 // ─── --sv-table (CSV position mode with --flank) ─────────────────────────────
@@ -135,6 +135,7 @@ fn sv_table_csv_position_with_flank() {
         .args(["--sv-table", &fixture("sv_table_pos.csv"), "--flank", "5"])
         .assert()
         .success()
+        // sv_table_pos.csv has no NAME column, so headers are plain
         .stdout(predicate::str::contains(">chr1:5-15"))
         .stdout(predicate::str::contains(">chr2:5-15"));
 }
@@ -213,8 +214,8 @@ fn output_dir_sv_paired() {
     assert_eq!(entries.len(), 1, "SV pair should produce exactly 1 file");
 
     let content = fs::read_to_string(entries[0].path()).unwrap();
-    assert!(content.contains(">chr1:1-10"));
-    assert!(content.contains(">chr2:1-10"));
+    assert!(content.contains(">SV001 chr1:1-10"));
+    assert!(content.contains(">SV001 chr2:1-10"));
 }
 
 // ─── Error cases ─────────────────────────────────────────────────────────────
@@ -327,6 +328,154 @@ fn table_columns_in_any_order() {
         .args(["--table", csv_path.to_str().unwrap()])
         .assert()
         .success()
+        .stdout(predicate::str::contains(">foo chr1:1-10"))
+        .stdout(predicate::str::contains("AAACCCGGGT"));
+}
+
+// ─── NAME in output headers ─────────────────────────────────────────────────
+
+#[test]
+fn name_absent_gives_plain_header() {
+    // table_range.csv has no NAME column
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", &fixture("table_range.csv")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"));
+}
+
+#[test]
+fn name_present_appears_in_header() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("named.csv");
+    fs::write(&csv_path, "CHROM,START,END,NAME\nchr1,1,10,myregion\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">myregion chr1:1-10"));
+}
+
+// ─── NAME in per-region filenames ────────────────────────────────────────────
+
+#[test]
+fn output_dir_uses_name_in_filename() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("named.csv");
+    fs::write(&csv_path, "CHROM,START,END,NAME\nchr1,1,10,myregion\n").unwrap();
+    let dir = tmp.path().join("seqs");
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .args(["--output-dir", dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert!(dir.join("myregion_1_10.fa").exists());
+    let content = fs::read_to_string(dir.join("myregion_1_10.fa")).unwrap();
+    assert!(content.contains(">myregion chr1:1-10"));
+}
+
+// ─── Inline position+flank syntax ───────────────────────────────────────────
+
+#[test]
+fn regions_position_plus_flank() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:10+5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:5-15"));
+}
+
+// ─── Combining multiple input sources ────────────────────────────────────────
+
+#[test]
+fn combine_regions_and_list() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args(["--list", &fixture("regions.txt")])
+        .assert()
+        .success()
+        // regions.txt has chr1:1-10, chr2:1-10, chr3:1-10
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr2:1-10"))
+        .stdout(predicate::str::contains(">chr3:1-10"));
+}
+
+// ─── FASTA line wrapping ─────────────────────────────────────────────────────
+
+#[test]
+fn output_wraps_at_60_characters() {
+    // Extract a region longer than 60bp to verify wrapping
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-80"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-80\n"))
+        // First wrapped line should be exactly 60 chars
+        .stdout(predicate::function(|output: &str| {
+            let lines: Vec<&str> = output.lines().collect();
+            // line 0 is header, line 1 is first seq line
+            lines.len() >= 3 && lines[1].len() == 60 && lines[2].len() == 20
+        }));
+}
+
+// ─── Position mode with small position clamps start to 1 ────────────────────
+
+#[test]
+fn table_position_clamps_start_to_one() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("edge.csv");
+    // POS=3 with flank=10 would give start=-7, should clamp to 1
+    fs::write(&csv_path, "CHROM,POS\nchr1,3\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap(), "--flank", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-13"));
+}
+
+// ─── Swapped start/end in region string ──────────────────────────────────────
+
+#[test]
+fn regions_swapped_start_end() {
+    // start > end should be normalized
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:10-1"])
+        .assert()
+        .success()
         .stdout(predicate::str::contains(">chr1:1-10"))
         .stdout(predicate::str::contains("AAACCCGGGT"));
+}
+
+// ─── SV paired file uses NAME ────────────────────────────────────────────────
+
+#[test]
+fn output_dir_sv_paired_uses_name() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("sv_named");
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--sv-table", &fixture("sv_table_range.tsv")])
+        .args(["--output-dir", dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // sv_table_range.tsv has NAME=SV001
+    let expected_file = dir.join("SV001_chr1_1_10_chr2_1_10.fa");
+    assert!(expected_file.exists(), "SV file should use NAME in filename");
+    let content = fs::read_to_string(&expected_file).unwrap();
+    assert!(content.contains(">SV001 chr1:1-10"));
+    assert!(content.contains(">SV001 chr2:1-10"));
 }
