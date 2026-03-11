@@ -1,32 +1,38 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{ArgAction, Parser};
+use clap::Parser;
 use rayon::prelude::*;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
-use std::io::Seek;
-use std::io::{self, BufRead, BufReader, BufWriter, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// A genomic interval (1-based inclusive).
+// ─── Data types ──────────────────────────────────────────────────────────────
+
+/// A genomic interval (1-based, inclusive on both ends).
 #[derive(Debug, Clone)]
 struct Region {
     name: Option<String>,
     chr: String,
-    start: u64, // 1-based inclusive
-    end: u64,   // 1-based inclusive
+    start: u64,
+    end: u64,
 }
 
+/// One record from a `.fai` index file.
 #[derive(Debug, Clone)]
 struct FaiRecord {
+    /// Total number of bases in this contig.
     length: u64,
-    offset: u64,     // byte offset of first base of this contig in the FASTA
-    line_bases: u64, // number of bases per FASTA line
-    line_bytes: u64, // number of bytes per FASTA line (includes newline(s))
+    /// Byte offset of the first base in the FASTA file.
+    offset: u64,
+    /// Number of sequence bases per line.
+    line_bases: u64,
+    /// Number of bytes per line (bases + newline characters).
+    line_bytes: u64,
 }
 
-/// CLI definition
+// ─── CLI definition ──────────────────────────────────────────────────────────
+
 #[derive(Parser, Debug)]
 #[command(
     name = "multiseqex",
@@ -35,46 +41,59 @@ struct FaiRecord {
     about = "Multi-sequence extractor for FASTA using FAI"
 )]
 struct Cli {
-    /// Reference FASTA file (bgzipped FASTA is fine as long as a matching .fai exists)
+    /// Reference FASTA file (bgzipped ok if a matching .fai exists).
     fasta: PathBuf,
 
-    /// Comma-separated regions: chr:start-end,chr2:start-end,...
+    /// Comma-separated regions: chr:start-end, chr2:start-end, ...
     #[arg(long)]
     regions: Option<String>,
 
-    /// File with one region per line in the form chr:start-end
+    /// File with one region per line (chr:start-end).
     #[arg(long)]
     list: Option<PathBuf>,
 
-    /// CSV/TSV with 3 columns: chr,start,end (header allowed)
-    /// Delimiter auto-detected from extension: .tsv => tab, else comma
+    /// CSV/TSV table with named columns.
+    ///
+    /// Required: CHROM.
+    /// Range mode: CHROM, START, END.
+    /// Position mode: CHROM, POS (requires --flank).
+    /// Optional: NAME.
+    /// Extra columns are ignored. Delimiter auto-detected (.tsv → tab, else comma).
     #[arg(long)]
     table: Option<PathBuf>,
 
-    /// Flank size (only used if table has chr,pos with 2 columns)
-    #[arg(long)]
-    flank: Option<u64>,
-
-    /// Output FASTA file (single combined; default: stdout)
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Output directory for per-sequence FASTA files
-    #[arg(long)]
-    output_dir: Option<PathBuf>,
-
-    /// Number of worker threads (default: Rayon default, usually #cpus)
-    #[arg(long)]
-    threads: Option<usize>,
-
-    /// CSV/TSV with 4 or 6 columns for SVs: chrom_left, pos_left, chrom_right, pos_right [, start_left, end_left, start_right, end_right]
+    /// CSV/TSV structural-variant table with named columns.
+    ///
+    /// Required: CHROM_LEFT, CHROM_RIGHT.
+    /// Range mode: START_LEFT, END_LEFT, START_RIGHT, END_RIGHT.
+    /// Position mode: POS_LEFT, POS_RIGHT (requires --flank).
+    /// Optional: NAME.
+    /// Extra columns are ignored.
     #[arg(long)]
     sv_table: Option<PathBuf>,
 
-    /// Do not build a .fai if missing (error instead)
-    #[arg(long, action=ArgAction::SetTrue)]
+    /// Flank size for position-mode tables (required with POS columns).
+    #[arg(long)]
+    flank: Option<u64>,
+
+    /// Output FASTA file (single combined file; default: stdout).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output directory — one FASTA file per region (or per SV pair).
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Number of worker threads (default: all available CPUs).
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Error if .fai is missing instead of building one automatically.
+    #[arg(long)]
     no_build_fai: bool,
 }
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -86,7 +105,13 @@ fn main() -> Result<()> {
             .ok();
     }
 
-    // Ensure .fai exists (or build it)
+    if cli.output.is_some() && cli.output_dir.is_some() {
+        return Err(anyhow!(
+            "Cannot use both --output and --output-dir simultaneously"
+        ));
+    }
+
+    // Ensure .fai exists (or build it).
     let fai_path = fai_path_for(&cli.fasta);
     if !fai_path.exists() {
         if cli.no_build_fai {
@@ -98,11 +123,10 @@ fn main() -> Result<()> {
         eprintln!("Index not found. Building FAI: {}", fai_path.display());
         build_fai(&cli.fasta, &fai_path)?;
     }
-
     let fai_index = read_fai(&fai_path)?;
 
-    // Collect regions from any combination of inputs
-    let mut regions: Vec<Region> = Vec::new();
+    // Collect regions from all input sources.
+    let mut regions = Vec::<Region>::new();
     if let Some(s) = cli.regions.as_deref() {
         regions.extend(parse_regions_inline(s, cli.flank)?);
     }
@@ -118,67 +142,40 @@ fn main() -> Result<()> {
 
     if regions.is_empty() {
         return Err(anyhow!(
-            "No regions provided. Use --regions, --list, or --table."
+            "No regions provided. Use --regions, --list, --table, or --sv-table."
         ));
     }
 
-    // Validate & clamp to contig lengths
-    let mut bad: Vec<String> = Vec::new();
-    for r in regions.iter_mut() {
-        if let Some(rec) = fai_index.get(&r.chr) {
-            if r.start == 0 {
-                r.start = 1;
-            }
-            if r.end == 0 {
-                r.end = 1;
-            }
-            r.start = min(r.start, rec.length);
-            r.end = min(r.end, rec.length);
-            if r.start > r.end {
-                std::mem::swap(&mut r.start, &mut r.end);
-            }
-        } else {
-            bad.push(r.chr.clone());
-        }
-    }
-    if !bad.is_empty() {
-        return Err(anyhow!(
-            "Contigs not found in FASTA/FAI: {}",
-            unique_join(&bad, ", ")
-        ));
-    }
+    // Validate and clamp regions to contig lengths.
+    validate_and_clamp_regions(&mut regions, &fai_index)?;
 
-    // Enforce mutually exclusive output options
-    if cli.output.is_some() && cli.output_dir.is_some() {
-        return Err(anyhow!(
-            "Cannot use both --output and --output-dir simultaneously"
-        ));
-    }
-
-    // Extract and write sequences
+    let is_sv = cli.sv_table.is_some();
     write_sequences(
         &cli.fasta,
         &fai_index,
         &regions,
         cli.output.as_deref(),
         cli.output_dir.as_deref(),
-        cli.sv_table.as_deref(),
+        is_sv,
     )?;
 
     Ok(())
 }
 
-/// Compute the .fai path next to a FASTA
+// ─── FAI helpers ─────────────────────────────────────────────────────────────
+
+/// Compute the `.fai` path for a given FASTA file.
 fn fai_path_for(fasta: &Path) -> PathBuf {
-    let s = fasta.to_string_lossy();
-    PathBuf::from(format!("{}.fai", s))
+    let mut s = fasta.as_os_str().to_owned();
+    s.push(".fai");
+    PathBuf::from(s)
 }
 
-/// Minimal .fai builder
+/// Build a minimal `.fai` index from a FASTA file.
 fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
     let f = File::open(fasta)
         .with_context(|| format!("Cannot open FASTA for indexing: {}", fasta.display()))?;
-    let mut r = BufReader::new(f);
+    let mut reader = BufReader::new(f);
     let mut out = BufWriter::new(
         File::create(fai_out)
             .with_context(|| format!("Cannot create FAI: {}", fai_out.display()))?,
@@ -192,44 +189,39 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
     let mut seq_len: u64 = 0;
     let mut line_bases: u64 = 0;
     let mut line_bytes: u64 = 0;
-    let mut first_seq_line_seen = false;
+    let mut first_seq_line = true;
 
     loop {
         line.clear();
-        let n = r.read_line(&mut line)?;
+        let n = reader.read_line(&mut line)?;
         if n == 0 {
+            // EOF — flush last contig.
             if let Some(name) = current_name.take() {
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}\t{}",
-                    name, seq_len, seq_offset, line_bases, line_bytes
-                )?;
+                writeln!(out, "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}")?;
             }
             break;
         }
 
         let raw = line.as_bytes();
         let linelen = raw.len() as u64;
+
         if raw.starts_with(b">") {
+            // New contig header — flush the previous one.
             if let Some(name) = current_name.replace(parse_fasta_header(&line)) {
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}\t{}",
-                    name, seq_len, seq_offset, line_bases, line_bytes
-                )?;
+                writeln!(out, "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}")?;
             }
             seq_offset = pos + linelen;
             seq_len = 0;
             line_bases = 0;
             line_bytes = 0;
-            first_seq_line_seen = false;
+            first_seq_line = true;
         } else {
-            let (bases_count, bytes_count) = count_bases_and_bytes(raw);
-            seq_len += bases_count;
-            if !first_seq_line_seen {
-                line_bases = bases_count;
-                line_bytes = bytes_count;
-                first_seq_line_seen = true;
+            let bases = count_bases(raw);
+            seq_len += bases;
+            if first_seq_line {
+                line_bases = bases;
+                line_bytes = linelen;
+                first_seq_line = false;
             }
         }
         pos += linelen;
@@ -239,66 +231,30 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extract the first whitespace-delimited token after `>`.
 fn parse_fasta_header(s: &str) -> String {
     s.trim_start_matches('>')
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_string()
 }
 
-fn count_bases_and_bytes(raw: &[u8]) -> (u64, u64) {
-    let mut bases = 0u64;
-    let bytes = raw.len() as u64;
-    for &b in raw {
-        if matches!(
-            b,
-            b'A' | b'C'
-                | b'G'
-                | b'T'
-                | b'U'
-                | b'R'
-                | b'Y'
-                | b'S'
-                | b'W'
-                | b'K'
-                | b'M'
-                | b'B'
-                | b'D'
-                | b'H'
-                | b'V'
-                | b'N'
-                | b'a'
-                | b'c'
-                | b'g'
-                | b't'
-                | b'u'
-                | b'r'
-                | b'y'
-                | b's'
-                | b'w'
-                | b'k'
-                | b'm'
-                | b'b'
-                | b'd'
-                | b'h'
-                | b'v'
-                | b'n'
-        ) {
-            bases += 1;
-        }
-    }
-    (bases, bytes)
+/// Count IUPAC nucleotide characters in a raw line.
+fn count_bases(raw: &[u8]) -> u64 {
+    raw.iter()
+        .filter(|b| b.is_ascii_alphabetic())
+        .count() as u64
 }
 
+/// Read a `.fai` file into a contig-name → `FaiRecord` map.
 fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
-    let f =
-        File::open(fai_path).with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
-    let r = BufReader::new(f);
+    let f = File::open(fai_path)
+        .with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
+    let reader = BufReader::new(f);
     let mut map = HashMap::new();
 
-    for (i, line) in r.lines().enumerate() {
+    for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -307,37 +263,33 @@ fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
         if parts.len() < 5 {
             return Err(anyhow!("Malformed FAI line {}: {}", i + 1, line));
         }
-        let name = parts[0].to_string();
-        let length: u64 = parts[1].parse()?;
-        let offset: u64 = parts[2].parse()?;
-        let line_bases: u64 = parts[3].parse()?;
-        let line_bytes: u64 = parts[4].parse()?;
         map.insert(
-            name,
+            parts[0].to_string(),
             FaiRecord {
-                length,
-                offset,
-                line_bases,
-                line_bytes,
+                length: parts[1].parse().with_context(|| format!("Bad length, FAI line {}", i + 1))?,
+                offset: parts[2].parse().with_context(|| format!("Bad offset, FAI line {}", i + 1))?,
+                line_bases: parts[3].parse().with_context(|| format!("Bad line_bases, FAI line {}", i + 1))?,
+                line_bytes: parts[4].parse().with_context(|| format!("Bad line_bytes, FAI line {}", i + 1))?,
             },
         );
     }
     Ok(map)
 }
 
-/// Extract a region using FAI math
+// ─── Sequence extraction ─────────────────────────────────────────────────────
+
+/// Extract a region from a FASTA file using the FAI index.
 fn extract_region(fasta: &Path, fai: &HashMap<String, FaiRecord>, r: &Region) -> Result<String> {
     let rec = fai
         .get(&r.chr)
-        .ok_or_else(|| anyhow!("Contig {} not in index", r.chr))?;
-    let start = r.start;
-    let end = r.end;
-    if start < 1 || end < 1 || start > rec.length || end > rec.length {
+        .ok_or_else(|| anyhow!("Contig '{}' not in index", r.chr))?;
+
+    if r.start < 1 || r.end < 1 || r.start > rec.length || r.end > rec.length {
         return Err(anyhow!(
-            "Region out of bounds {}:{}-{} (len={})",
+            "Region out of bounds {}:{}-{} (contig length={})",
             r.chr,
-            start,
-            end,
+            r.start,
+            r.end,
             rec.length
         ));
     }
@@ -347,561 +299,470 @@ fn extract_region(fasta: &Path, fai: &HashMap<String, FaiRecord>, r: &Region) ->
     let lb = rec.line_bases;
     let lby = rec.line_bytes;
 
-    let mut seq = Vec::<u8>::with_capacity((end - start + 1) as usize);
-    let mut p = start;
-    while p <= end {
-        let line_idx = (p - 1) / lb;
-        let in_line_offset = (p - 1) % lb;
-        let to_line_end = lb - in_line_offset;
-        let remaining = end - p + 1;
-        let run = min(to_line_end, remaining);
+    let mut seq = Vec::<u8>::with_capacity((r.end - r.start + 1) as usize);
+    let mut pos = r.start;
+
+    while pos <= r.end {
+        let line_idx = (pos - 1) / lb;
+        let in_line_offset = (pos - 1) % lb;
+        let run = min(lb - in_line_offset, r.end - pos + 1);
         let byte_pos = rec.offset + line_idx * lby + in_line_offset;
+
         f.seek(SeekFrom::Start(byte_pos))?;
         let mut buf = vec![0u8; run as usize];
         f.read_exact(&mut buf)?;
         seq.extend_from_slice(&buf);
-        p += run;
+
+        pos += run;
     }
 
-    for b in seq.iter_mut() {
-        *b = b.to_ascii_uppercase();
+    // Normalise to uppercase.
+    for b in &mut seq {
+        b.make_ascii_uppercase();
     }
     Ok(String::from_utf8(seq)?)
 }
 
-/// Parse comma-separated inline regions
+// ─── Region parsing: inline & list ───────────────────────────────────────────
+
+/// Parse comma-separated inline region strings.
 fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Region>> {
-    let mut out = Vec::new();
-    for (_i, tok) in s.split(',').enumerate() {
-        if tok.trim().is_empty() {
-            continue;
-        }
-        out.push(parse_region_str(tok.trim(), flank)?);
-    }
-    Ok(out)
+    s.split(',')
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| parse_region_str(t.trim(), flank))
+        .collect()
 }
 
-/// Parse line-based list file
+/// Parse a file with one region string per line.
 fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let f =
-        File::open(path).with_context(|| format!("Cannot open list file: {}", path.display()))?;
-    let r = BufReader::new(f);
-    let mut out = Vec::new();
-    for (_i, line) in r.lines().enumerate() {
-        let l = line?;
-        if l.trim().is_empty() || l.starts_with('#') {
-            continue;
-        }
-        out.push(parse_region_str(l.trim(), flank)?);
-    }
-    Ok(out)
+    let f = File::open(path)
+        .with_context(|| format!("Cannot open list file: {}", path.display()))?;
+    BufReader::new(f)
+        .lines()
+        .filter_map(|l| {
+            let l = l.ok()?;
+            let trimmed = l.trim().to_string();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .map(|l| parse_region_str(&l, flank))
+        .collect()
 }
 
-/// Parse a single region string
+/// Parse a single region string: `chr:start-end` or `chr:pos+flank`.
 fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
-    // Case: chr:start-end or chr:pos±flank
     let (chr, rest) = s
         .split_once(':')
         .ok_or_else(|| anyhow!("Bad region (missing ':'): {}", s))?;
-    if let Some((start, end)) = rest.split_once('-') {
-        let start: u64 = start.replace(',', "").parse()?;
-        let end: u64 = end.replace(',', "").parse()?;
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
+
+    // chr:start-end
+    if let Some((start_s, end_s)) = rest.split_once('-') {
+        let start: u64 = start_s.replace(',', "").parse()
+            .with_context(|| format!("Bad start in region: {s}"))?;
+        let end: u64 = end_s.replace(',', "").parse()
+            .with_context(|| format!("Bad end in region: {s}"))?;
         return Ok(Region {
             name: None,
             chr: chr.to_string(),
-            start,
-            end,
+            start: min(start, end),
+            end: max(start, end),
         });
     }
 
-    // pos±flank
-    let (pos, flank_val) = if let Some((p, f)) = rest.split_once('+') {
-        (p, f)
-    } else if let Some((p, f)) = rest.split_once('-') {
-        (p, f)
-    } else {
-        return Err(anyhow!(
-            "Bad region format (expected start-end or pos±flank): {}",
-            s
-        ));
-    };
+    // chr:pos+flank
+    let (pos_s, flank_s) = rest
+        .split_once('+')
+        .ok_or_else(|| anyhow!("Bad region format (expected start-end or pos+flank): {s}"))?;
 
-    let flank = flank.unwrap_or(0);
-
-    let pos: u64 = pos.replace(',', "").parse()?;
-    let flank_val: u64 = flank_val.replace(',', "").parse()?;
-    let start = pos.saturating_sub(flank_val.max(flank));
-    let end = pos + flank_val.max(flank);
+    let pos: u64 = pos_s.replace(',', "").parse()
+        .with_context(|| format!("Bad position in region: {s}"))?;
+    let inline_flank: u64 = flank_s.replace(',', "").parse()
+        .with_context(|| format!("Bad flank in region: {s}"))?;
+    let effective_flank = inline_flank.max(flank.unwrap_or(0));
 
     Ok(Region {
         name: None,
         chr: chr.to_string(),
-        start: start.max(1),
-        end,
+        start: pos.saturating_sub(effective_flank).max(1),
+        end: pos + effective_flank,
     })
 }
 
-/// Parse CSV/TSV table (2 or 3 columns)
-fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = if path
+// ─── Region parsing: CSV/TSV tables ──────────────────────────────────────────
+
+/// Build a case-insensitive header-name → column-index map.
+fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.trim().to_uppercase(), i))
+        .collect()
+}
+
+/// Auto-detect CSV/TSV delimiter from file extension.
+fn detect_delimiter(path: &Path) -> u8 {
+    let is_tsv = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("tsv"))
-        .unwrap_or(false)
-    {
-        b'\t'
-    } else {
-        b','
-    };
+        .is_some_and(|e| e.eq_ignore_ascii_case("tsv"));
+    if is_tsv { b'\t' } else { b',' }
+}
+
+/// Parse a numeric field from a CSV record, with a contextual error message.
+fn parse_u64_field(
+    rec: &csv::StringRecord,
+    col_idx: usize,
+    field_name: &str,
+    row: usize,
+) -> Result<u64> {
+    rec.get(col_idx)
+        .ok_or_else(|| anyhow!("Missing {field_name} at row {row}"))?
+        .trim()
+        .replace(',', "")
+        .parse()
+        .with_context(|| format!("Bad {field_name} at row {row}"))
+}
+
+/// Look up a required column by name, returning a helpful error if absent.
+fn require_column(
+    hmap: &HashMap<String, usize>,
+    name: &str,
+    headers: &csv::StringRecord,
+) -> Result<usize> {
+    hmap.get(name)
+        .copied()
+        .ok_or_else(|| anyhow!("Table missing required {name} column (found: {headers:?})"))
+}
+
+/// Read a string field from a CSV record.
+fn read_string_field(rec: &csv::StringRecord, col_idx: usize) -> Result<String> {
+    Ok(rec
+        .get(col_idx)
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+/// Read an optional NAME field (returns `None` if the column is absent or empty).
+fn read_optional_name(rec: &csv::StringRecord, name_idx: Option<usize>) -> Option<String> {
+    name_idx.and_then(|idx| {
+        rec.get(idx)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+enum TableMode {
+    Range { start_idx: usize, end_idx: usize },
+    Position { pos_idx: usize },
+}
+
+/// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME.
+fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
+    let delim = detect_delimiter(path);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
         .from_path(path)
         .with_context(|| format!("Cannot open table: {}", path.display()))?;
-    let headers = rdr.headers().map(|h| h.clone()).ok();
 
-    let mut out = Vec::new();
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
 
-    // Determine mode
-    let mode = {
-        let headers = rdr.headers()?;
-        headers.len()
-    };
+    let chrom_idx = require_column(&hmap, "CHROM", &headers)?;
+    let name_idx = hmap.get("NAME").copied();
 
-    if ![2, 3, 4].contains(&mode) {
-        return Err(anyhow!("Table must have [2,3,4] columns (got {})", mode));
-    } else if ![2, 3].contains(&mode) && flank.is_some() {
-        return Err(anyhow!(
-            "--flank can only be used with 2 or 3-column tables"
-        ));
-    }
+    let has_start = hmap.get("START").copied();
+    let has_end = hmap.get("END").copied();
+    let has_pos = hmap.get("POS").copied();
 
-    // Unwrap flank when validation is done
-    let flank = flank.unwrap_or(0);
-
-    let process_record = |rec: csv::StringRecord, idx: usize| -> Result<Region> {
-        match mode {
-            2 => {
-                let chr = rec.get(0).unwrap().trim();
-                let pos: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                let start = pos.saturating_sub(flank);
-                let end = pos + flank;
-                Ok(Region {
-                    name: None,
-                    chr: chr.to_string(),
-                    start,
-                    end,
-                })
-            }
-            3 => {
-                let chr = rec.get(0).unwrap().trim();
-                let start: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                let end: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end at row {} (headers {:?})", idx + 1, headers)
-                    })?;
-                Ok(Region {
-                    name: None,
-                    chr: chr.to_string(),
-                    start: min(start, end),
-                    end: max(start, end),
-                })
-            }
-            _ => unreachable!(),
-        }
-    };
-
-    for (i, rec) in rdr.records().enumerate() {
-        let rec = rec?;
-        if rec.len() != mode {
+    let mode = match (has_start, has_end, has_pos) {
+        (Some(s), Some(e), None) => TableMode::Range {
+            start_idx: s,
+            end_idx: e,
+        },
+        (None, None, Some(p)) => TableMode::Position { pos_idx: p },
+        (Some(_), Some(_), Some(_)) => {
             return Err(anyhow!(
-                "Row {} has {} columns but expected {}",
-                i + 2,
-                rec.len(),
-                mode
+                "Table has both START/END and POS columns — ambiguous. \
+                 Use either START+END (range) or POS (position)."
             ));
         }
-        out.push(process_record(rec, i + 1)?);
-    }
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err(anyhow!(
+                "Table has only one of START/END — both are required for range mode (found: {headers:?})"
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "Table must have START+END or POS columns (found: {headers:?})"
+            ));
+        }
+    };
 
+    if matches!(mode, TableMode::Position { .. }) && flank.is_none() {
+        return Err(anyhow!(
+            "--flank is required when table uses POS column (position mode)"
+        ));
+    }
+    let flank = flank.unwrap_or(0);
+
+    let mut out = Vec::new();
+    for (i, rec) in rdr.records().enumerate() {
+        let rec = rec?;
+        let row = i + 2;
+        let chr = read_string_field(&rec, chrom_idx)?;
+        let name = read_optional_name(&rec, name_idx);
+
+        let region = match &mode {
+            TableMode::Range { start_idx, end_idx } => {
+                let s = parse_u64_field(&rec, *start_idx, "START", row)?;
+                let e = parse_u64_field(&rec, *end_idx, "END", row)?;
+                Region { name, chr, start: min(s, e), end: max(s, e) }
+            }
+            TableMode::Position { pos_idx } => {
+                let p = parse_u64_field(&rec, *pos_idx, "POS", row)?;
+                Region { name, chr, start: p.saturating_sub(flank), end: p + flank }
+            }
+        };
+        out.push(region);
+    }
     Ok(out)
 }
 
+enum SvMode {
+    Range {
+        start_left_idx: usize,
+        end_left_idx: usize,
+        start_right_idx: usize,
+        end_right_idx: usize,
+    },
+    Position {
+        pos_left_idx: usize,
+        pos_right_idx: usize,
+    },
+}
+
+/// Parse a CSV/TSV SV table with named columns.
 fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("tsv"))
-        .unwrap_or(false)
-    {
-        b'\t'
-    } else {
-        b','
-    };
+    let delim = detect_delimiter(path);
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
         .from_path(path)
         .with_context(|| format!("Cannot open SV table: {}", path.display()))?;
-    let headers = rdr.headers().map(|h| h.clone()).ok();
 
-    let mut out = Vec::new();
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
 
-    // Determine mode
-    let mode = {
-        let headers = rdr.headers().context("Failed to read headers")?;
-        headers.len()
+    let chrom_left_idx = require_column(&hmap, "CHROM_LEFT", &headers)?;
+    let chrom_right_idx = require_column(&hmap, "CHROM_RIGHT", &headers)?;
+    let name_idx = hmap.get("NAME").copied();
+
+    let has_sl = hmap.get("START_LEFT").copied();
+    let has_el = hmap.get("END_LEFT").copied();
+    let has_sr = hmap.get("START_RIGHT").copied();
+    let has_er = hmap.get("END_RIGHT").copied();
+    let has_pl = hmap.get("POS_LEFT").copied();
+    let has_pr = hmap.get("POS_RIGHT").copied();
+
+    let mode = match (has_sl, has_el, has_sr, has_er, has_pl, has_pr) {
+        (Some(sl), Some(el), Some(sr), Some(er), _, _) => SvMode::Range {
+            start_left_idx: sl,
+            end_left_idx: el,
+            start_right_idx: sr,
+            end_right_idx: er,
+        },
+        (None, None, None, None, Some(pl), Some(pr)) => SvMode::Position {
+            pos_left_idx: pl,
+            pos_right_idx: pr,
+        },
+        _ => {
+            return Err(anyhow!(
+                "SV table must have START_LEFT+END_LEFT+START_RIGHT+END_RIGHT (range) \
+                 or POS_LEFT+POS_RIGHT (position). Found: {headers:?}"
+            ));
+        }
     };
-    if ![4, 5, 6, 7].contains(&mode) {
+
+    if matches!(mode, SvMode::Position { .. }) && flank.is_none() {
         return Err(anyhow!(
-            "SV tables must have [4,5,6,7] columns (got {})",
-            mode
+            "--flank is required when SV table uses POS_LEFT/POS_RIGHT (position mode)"
         ));
     }
+    let flank = flank.unwrap_or(0);
 
+    let mut out = Vec::new();
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec?;
-        match mode {
-            4 => {
-                if flank.is_none() {
-                    return Err(anyhow!(
-                        "--flank must be set for 4-column SV tables (row {}: headers {:?})",
-                        i + 2,
-                        headers
-                    ));
-                }
-                // chrom_left, pos_left, chrom_right, pos_right
-                let chr_left = rec.get(0).unwrap().trim();
-                let pos_left: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(2).unwrap().trim();
-                let pos_right: u64 = rec
-                    .get(3)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let flank = flank.unwrap_or(0);
-                out.push(Region {
-                    name: None,
-                    chr: chr_left.to_string(),
-                    start: pos_left.saturating_sub(flank),
-                    end: pos_left + flank,
-                });
-                out.push(Region {
-                    name: None,
-                    chr: chr_right.to_string(),
-                    start: pos_right.saturating_sub(flank),
-                    end: pos_right + flank,
-                });
+        let row = i + 2;
+        let chr_left = read_string_field(&rec, chrom_left_idx)?;
+        let chr_right = read_string_field(&rec, chrom_right_idx)?;
+        let name = read_optional_name(&rec, name_idx);
+
+        match &mode {
+            SvMode::Range { start_left_idx, end_left_idx, start_right_idx, end_right_idx } => {
+                let sl = parse_u64_field(&rec, *start_left_idx, "START_LEFT", row)?;
+                let el = parse_u64_field(&rec, *end_left_idx, "END_LEFT", row)?;
+                let sr = parse_u64_field(&rec, *start_right_idx, "START_RIGHT", row)?;
+                let er = parse_u64_field(&rec, *end_right_idx, "END_RIGHT", row)?;
+                out.push(Region { name: name.clone(), chr: chr_left, start: min(sl, el), end: max(sl, el) });
+                out.push(Region { name, chr: chr_right, start: min(sr, er), end: max(sr, er) });
             }
-            5 => {
-                // name, chrom_left, pos_left, chrom_right, pos_right
-                if flank.is_none() {
-                    return Err(anyhow!(
-                        "--flank must be set for 5-column SV tables (row {}: headers {:?})",
-                        i + 2,
-                        headers
-                    ));
-                }
-                let name = rec.get(0).unwrap().trim().to_string();
-                let chr_left = rec.get(1).unwrap().trim();
-                let pos_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(3).unwrap().trim();
-                let pos_right: u64 = rec
-                    .get(4)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad pos_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let flank = flank.unwrap();
-                out.push(Region {
-                    name: Some(name.clone()),
-                    chr: chr_left.to_string(),
-                    start: pos_left.saturating_sub(flank),
-                    end: pos_left + flank,
-                });
-                out.push(Region {
-                    name: Some(name),
-                    chr: chr_right.to_string(),
-                    start: pos_right.saturating_sub(flank),
-                    end: pos_right + flank,
-                });
+            SvMode::Position { pos_left_idx, pos_right_idx } => {
+                let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
+                let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
+                out.push(Region { name: name.clone(), chr: chr_left, start: pl.saturating_sub(flank), end: pl + flank });
+                out.push(Region { name, chr: chr_right, start: pr.saturating_sub(flank), end: pr + flank });
             }
-            6 => {
-                // chrom_left, start_left, end_left, chrom_right, start_right, end_right
-                let chr_left = rec.get(0).unwrap().trim();
-                let start_left: u64 = rec
-                    .get(1)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(3).unwrap().trim();
-                let start_right: u64 = rec
-                    .get(4)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_right: u64 = rec
-                    .get(5)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                out.push(Region {
-                    name: None,
-                    chr: chr_left.to_string(),
-                    start: min(start_left, end_left),
-                    end: max(start_left, end_left),
-                });
-                out.push(Region {
-                    name: None,
-                    chr: chr_right.to_string(),
-                    start: min(start_right, end_right),
-                    end: max(start_right, end_right),
-                });
-            }
-            7 => {
-                // name, chrom_left, start_left, end_left, chrom_right, start_right, end_right
-                let name = rec.get(0).unwrap().trim().to_string();
-                let chr_left = rec.get(1).unwrap().trim();
-                let start_left: u64 = rec
-                    .get(2)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_left: u64 = rec
-                    .get(3)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_left at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let chr_right = rec.get(4).unwrap().trim();
-                let start_right: u64 = rec
-                    .get(5)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad start_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                let end_right: u64 = rec
-                    .get(6)
-                    .unwrap()
-                    .trim()
-                    .replace(',', "")
-                    .parse()
-                    .with_context(|| {
-                        format!("Bad end_right at row {} (headers {:?})", i + 2, headers)
-                    })?;
-                out.push(Region {
-                    name: Some(name.clone()),
-                    chr: chr_left.to_string(),
-                    start: min(start_left, end_left),
-                    end: max(start_left, end_left),
-                });
-                out.push(Region {
-                    name: Some(name),
-                    chr: chr_right.to_string(),
-                    start: min(start_right, end_right),
-                    end: max(start_right, end_right),
-                });
-            }
-            _ => unreachable!(),
         }
     }
     Ok(out)
 }
 
-/// Wrap sequence for FASTA output
+// ─── Validation ──────────────────────────────────────────────────────────────
+
+/// Validate that all regions reference known contigs and clamp to contig bounds.
+fn validate_and_clamp_regions(
+    regions: &mut [Region],
+    fai: &HashMap<String, FaiRecord>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+
+    for r in regions.iter_mut() {
+        if let Some(rec) = fai.get(&r.chr) {
+            r.start = r.start.max(1).min(rec.length);
+            r.end = r.end.max(1).min(rec.length);
+            if r.start > r.end {
+                std::mem::swap(&mut r.start, &mut r.end);
+            }
+        } else {
+            missing.push(r.chr.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        return Err(anyhow!(
+            "Contigs not found in FASTA/FAI: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+// ─── Output ──────────────────────────────────────────────────────────────────
+
+/// Wrap a sequence string to a fixed line width for FASTA output.
 fn wrap_fasta(seq: &str, width: usize) -> String {
-    if seq.is_empty() {
-        return String::new();
+    let mut out = String::with_capacity(seq.len() + seq.len() / width + 1);
+    for (i, chunk) in seq.as_bytes().chunks(width).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // SAFETY: input is valid UTF-8 ASCII, so chunks are too.
+        out.push_str(std::str::from_utf8(chunk).unwrap());
     }
-    let mut out = String::with_capacity(seq.len() + seq.len() / width + 8);
-    let mut i = 0usize;
-    while i < seq.len() {
-        let end = min(i + width, seq.len());
-        out.push_str(&seq[i..end]);
-        out.push('\n');
-        i = end;
-    }
-    out.trim_end_matches('\n').to_string()
+    out
 }
 
-fn unique_join(v: &[String], sep: &str) -> String {
-    use std::collections::BTreeSet;
-    let set: BTreeSet<_> = v.iter().cloned().collect();
-    set.into_iter().collect::<Vec<_>>().join(sep)
-}
-
-/// Write sequences either combined or per-file
+/// Extract and write all sequences to the requested destination.
 fn write_sequences(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
     output_file: Option<&Path>,
     output_dir: Option<&Path>,
-    sv_table: Option<&Path>,
+    is_sv: bool,
 ) -> Result<()> {
+    // Parallel extraction.
     let sequences: Vec<(Region, String)> = regions
         .par_iter()
         .map(|r| {
             let seq = extract_region(fasta_path, fai_index, r)?;
-            let header = format!(">{}:{}-{}\n", r.chr, r.start, r.end);
-            Ok::<_, anyhow::Error>((r.clone(), format!("{}{}\n", header, wrap_fasta(&seq, 60))))
+            let fasta_entry = format!(
+                ">{}:{}-{}\n{}\n",
+                r.chr,
+                r.start,
+                r.end,
+                wrap_fasta(&seq, 60)
+            );
+            Ok((r.clone(), fasta_entry))
         })
         .collect::<Result<_>>()?;
 
-    if let Some(dir) = output_dir {
-        std::fs::create_dir_all(dir)?;
-
-        if sv_table.is_some() {
-            // Check if number of sequences is even
-            if sequences.len() % 2 != 0 {
-                return Err(anyhow!(
-                    "Number of sequences ({}) is odd; SV table extraction requires an even number of regions (pairs).",
-                    sequences.len()
-                ));
+    match output_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
+            if is_sv {
+                write_sv_per_file(dir, &sequences)?;
+            } else {
+                write_per_file(dir, &sequences)?;
             }
-            // Group sequences into pairs (2 per file)
-            let chunked: Vec<_> = sequences.chunks(2).collect();
-            chunked
-                .into_par_iter()
-                .try_for_each(|pair| -> Result<()> {
-                    // Use names if present, else chr/start/end for both
-                    let filename = if pair.len() == 2 {
-                        let (r1, _) = &pair[0];
-                        let (r2, _) = &pair[1];
-                        match (&r1.name, &r2.name) {
-                            (Some(n1), Some(n2)) => {
-                                if n1 != n2 {
-                                    return Err(anyhow!("Mismatched names in SV pair: '{}' vs '{}'", n1, n2));
-                                }
-                                format!("{}_{}_{}_{}_{}_{}_{}.fa", n1, r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end)
-                            }
-                            _ => format!(
-                                "{}_{}_{}_{}_{}_{}.fa",
-                                r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end
-                            ),
-                        }
-                    } else {
-                        // Last file if odd count
-                        let (r, _) = &pair[0];
-                        match &r.name {
-                            Some(n) => format!("{}.fa", n),
-                            None => format!("{}_{}_{}.fa", r.chr, r.start, r.end),
-                        }
-                    };
-                    let filepath = dir.join(filename);
-                    let mut f = File::create(filepath)?;
-                    for (_, chunk) in &*pair {
-                        f.write_all(chunk.as_bytes())?;
-                    }
-                    Ok(())
-                })?;
-        } else {
-            sequences
-                .into_par_iter()
-                .try_for_each(|(region, chunk)| -> Result<()> {
-                    let filename = format!("{}_{}_{}.fa", region.chr, region.start, region.end);
-                    let filepath = dir.join(filename);
-                    let mut f = File::create(filepath)?;
-                    f.write_all(chunk.as_bytes())?;
-                    Ok(())
-                })?;
         }
-    } else {
-        let mut writer: Box<dyn Write> = match output_file {
-            Some(path) => Box::new(BufWriter::new(
-                File::options()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(path)?,
-            )),
-            None => Box::new(BufWriter::new(io::stdout())),
-        };
-        for (_region, chunk) in sequences {
-            writer.write_all(chunk.as_bytes())?;
+        None => {
+            let mut writer: Box<dyn Write> = match output_file {
+                Some(p) => Box::new(BufWriter::new(File::create(p)?)),
+                None => Box::new(BufWriter::new(io::stdout())),
+            };
+            for (_, entry) in &sequences {
+                writer.write_all(entry.as_bytes())?;
+            }
+            writer.flush()?;
         }
-        writer.flush()?;
+    }
+    Ok(())
+}
+
+/// Write one FASTA file per region.
+fn write_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
+    sequences
+        .par_iter()
+        .try_for_each(|(region, entry)| -> Result<()> {
+            let filename = format!("{}_{}_{}.fa", region.chr, region.start, region.end);
+            let mut f = File::create(dir.join(filename))?;
+            f.write_all(entry.as_bytes())?;
+            Ok(())
+        })
+}
+
+/// Write one FASTA file per SV pair (two regions per file).
+fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
+    if !sequences.len().is_multiple_of(2) {
+        return Err(anyhow!(
+            "SV extraction produced {} regions (expected even number for pairs)",
+            sequences.len()
+        ));
     }
 
-    Ok(())
+    sequences
+        .chunks(2)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .try_for_each(|pair| -> Result<()> {
+            let (r1, _) = &pair[0];
+            let (r2, _) = &pair[1];
+
+            let filename = match (&r1.name, &r2.name) {
+                (Some(n1), Some(n2)) if n1 == n2 => {
+                    format!("{n1}_{}_{}_{}_{}_{}_{}.fa", r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end)
+                }
+                (Some(n1), Some(n2)) => {
+                    return Err(anyhow!("Mismatched names in SV pair: '{n1}' vs '{n2}'"));
+                }
+                _ => {
+                    format!("{}_{}_{}_{}_{}_{}.fa", r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end)
+                }
+            };
+
+            let mut f = File::create(dir.join(filename))?;
+            for (_, entry) in pair.iter() {
+                f.write_all(entry.as_bytes())?;
+            }
+            Ok(())
+        })
 }
