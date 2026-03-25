@@ -3,7 +3,7 @@
 **Epic**: ARCH-001
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -20,8 +20,8 @@ Move unit tests alongside their modules. Integration tests remain in
 
 ## Success Criteria
 
-- [ ] `src/main.rs` is under 150 lines.
-- [ ] Each module has its own file with relevant unit tests.
-- [ ] All 33 existing tests pass without modification.
-- [ ] `cargo clippy -- -D warnings` is clean.
+- [x] `src/main.rs` is under 150 lines.
+- [x] Each module has its own file with relevant unit tests.
+- [x] All 97 existing tests pass without modification.
+- [x] `cargo clippy -- -D warnings` is clean.
 - [ ] /update has been run after changes.
