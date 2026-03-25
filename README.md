@@ -13,7 +13,7 @@ columns, list files, and inline regions).
 Usage: multiseqex [OPTIONS] <FASTA>
 
 Arguments:
-  <FASTA>  Reference FASTA file (bgzipped ok if a matching .fai exists)
+  <FASTA>  Reference FASTA file (plain text, not compressed)
 
 Options:
       --regions <REGIONS>        Comma-separated regions: chr:start-end, ...

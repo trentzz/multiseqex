@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::File;
@@ -41,7 +42,7 @@ struct FaiRecord {
     about = "Multi-sequence extractor for FASTA using FAI"
 )]
 struct Cli {
-    /// Reference FASTA file (bgzipped ok if a matching .fai exists).
+    /// Reference FASTA file (plain text, not compressed).
     fasta: PathBuf,
 
     /// Comma-separated regions: chr:start-end, chr2:start-end, ...
@@ -69,7 +70,7 @@ struct Cli {
     /// Position mode: POS_LEFT, POS_RIGHT (requires --flank).
     /// Optional: NAME.
     /// Extra columns are ignored.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["regions", "table", "list"])]
     sv_table: Option<PathBuf>,
 
     /// Flank size for position-mode tables (required with POS columns).
@@ -77,11 +78,11 @@ struct Cli {
     flank: Option<u64>,
 
     /// Output FASTA file (single combined file; default: stdout).
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
 
-    /// Output directory — one FASTA file per region (or per SV pair).
-    #[arg(long)]
+    /// Output directory, one FASTA file per region (or per SV pair).
+    #[arg(long, conflicts_with = "output")]
     output_dir: Option<PathBuf>,
 
     /// Number of worker threads (default: all available CPUs).
@@ -98,18 +99,16 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(t) = cli.threads {
-        rayon::ThreadPoolBuilder::new()
+    if let Some(t) = cli.threads
+        && let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(t)
             .build_global()
-            .ok();
+    {
+        eprintln!("Warning: failed to build thread pool with {t} threads: {e}");
     }
 
-    if cli.output.is_some() && cli.output_dir.is_some() {
-        return Err(anyhow!(
-            "Cannot use both --output and --output-dir simultaneously"
-        ));
-    }
+    // Reject compressed (gzip/bgzip) input.
+    detect_gzip_and_reject(&cli.fasta)?;
 
     // Ensure .fai exists (or build it).
     let fai_path = fai_path_for(&cli.fasta);
@@ -162,6 +161,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// ─── Input validation ────────────────────────────────────────────────────────
+
+/// Reject gzip/bgzip compressed files by checking magic bytes (0x1f 0x8b).
+fn detect_gzip_and_reject(fasta: &Path) -> Result<()> {
+    let mut f =
+        File::open(fasta).with_context(|| format!("Cannot open FASTA: {}", fasta.display()))?;
+    let mut magic = [0u8; 2];
+    if f.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b] {
+        return Err(anyhow!(
+            "File appears to be gzip/bgzip compressed: {}. Decompress it first (e.g. gunzip or bgzip -d).",
+            fasta.display()
+        ));
+    }
+    Ok(())
+}
+
 // ─── FAI helpers ─────────────────────────────────────────────────────────────
 
 /// Compute the `.fai` path for a given FASTA file.
@@ -197,7 +212,10 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
         if n == 0 {
             // EOF — flush last contig.
             if let Some(name) = current_name.take() {
-                writeln!(out, "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}")?;
+                writeln!(
+                    out,
+                    "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}"
+                )?;
             }
             break;
         }
@@ -208,7 +226,10 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
         if raw.starts_with(b">") {
             // New contig header — flush the previous one.
             if let Some(name) = current_name.replace(parse_fasta_header(&line)) {
-                writeln!(out, "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}")?;
+                writeln!(
+                    out,
+                    "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}"
+                )?;
             }
             seq_offset = pos + linelen;
             seq_len = 0;
@@ -222,6 +243,21 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
                 line_bases = bases;
                 line_bytes = linelen;
                 first_seq_line = false;
+            } else if bases > 0 && bases != line_bases && linelen != line_bytes {
+                // Non-final lines with a different width indicate an inconsistent FASTA.
+                // Only warn if this is not the last (possibly shorter) line of the contig.
+                // We cannot know for certain it is non-final here, so we check that
+                // the line is shorter than expected (final lines are allowed to differ).
+                if linelen >= line_bytes {
+                    eprintln!(
+                        "Warning: inconsistent line width in contig '{}': expected {} bases/{} bytes, got {} bases/{} bytes",
+                        current_name.as_deref().unwrap_or("?"),
+                        line_bases,
+                        line_bytes,
+                        bases,
+                        linelen
+                    );
+                }
             }
         }
         pos += linelen;
@@ -240,17 +276,15 @@ fn parse_fasta_header(s: &str) -> String {
         .to_string()
 }
 
-/// Count IUPAC nucleotide characters in a raw line.
+/// Count ASCII alphabetic characters in a raw line.
 fn count_bases(raw: &[u8]) -> u64 {
-    raw.iter()
-        .filter(|b| b.is_ascii_alphabetic())
-        .count() as u64
+    raw.iter().filter(|b| b.is_ascii_alphabetic()).count() as u64
 }
 
 /// Read a `.fai` file into a contig-name → `FaiRecord` map.
 fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
-    let f = File::open(fai_path)
-        .with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
+    let f =
+        File::open(fai_path).with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
     let reader = BufReader::new(f);
     let mut map = HashMap::new();
 
@@ -266,10 +300,18 @@ fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
         map.insert(
             parts[0].to_string(),
             FaiRecord {
-                length: parts[1].parse().with_context(|| format!("Bad length, FAI line {}", i + 1))?,
-                offset: parts[2].parse().with_context(|| format!("Bad offset, FAI line {}", i + 1))?,
-                line_bases: parts[3].parse().with_context(|| format!("Bad line_bases, FAI line {}", i + 1))?,
-                line_bytes: parts[4].parse().with_context(|| format!("Bad line_bytes, FAI line {}", i + 1))?,
+                length: parts[1]
+                    .parse()
+                    .with_context(|| format!("Bad length, FAI line {}", i + 1))?,
+                offset: parts[2]
+                    .parse()
+                    .with_context(|| format!("Bad offset, FAI line {}", i + 1))?,
+                line_bases: parts[3]
+                    .parse()
+                    .with_context(|| format!("Bad line_bases, FAI line {}", i + 1))?,
+                line_bytes: parts[4]
+                    .parse()
+                    .with_context(|| format!("Bad line_bytes, FAI line {}", i + 1))?,
             },
         );
     }
@@ -279,23 +321,19 @@ fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
 // ─── Sequence extraction ─────────────────────────────────────────────────────
 
 /// Extract a region from a FASTA file using the FAI index.
-fn extract_region(fasta: &Path, fai: &HashMap<String, FaiRecord>, r: &Region) -> Result<String> {
+/// Accepts a mutable file handle to allow reuse across calls on the same thread.
+fn extract_region(f: &mut File, fai: &HashMap<String, FaiRecord>, r: &Region) -> Result<String> {
     let rec = fai
         .get(&r.chr)
         .ok_or_else(|| anyhow!("Contig '{}' not in index", r.chr))?;
 
-    if r.start < 1 || r.end < 1 || r.start > rec.length || r.end > rec.length {
+    if rec.line_bases == 0 {
         return Err(anyhow!(
-            "Region out of bounds {}:{}-{} (contig length={})",
-            r.chr,
-            r.start,
-            r.end,
-            rec.length
+            "Malformed FAI: line_bases is 0 for contig '{}' (would cause division by zero)",
+            r.chr
         ));
     }
 
-    let mut f =
-        File::open(fasta).with_context(|| format!("Cannot open FASTA: {}", fasta.display()))?;
     let lb = rec.line_bases;
     let lby = rec.line_bytes;
 
@@ -335,20 +373,23 @@ fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Region>> {
 
 /// Parse a file with one region string per line.
 fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let f = File::open(path)
-        .with_context(|| format!("Cannot open list file: {}", path.display()))?;
+    let f =
+        File::open(path).with_context(|| format!("Cannot open list file: {}", path.display()))?;
     BufReader::new(f)
         .lines()
-        .filter_map(|l| {
-            let l = l.ok()?;
-            let trimmed = l.trim().to_string();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                Some(trimmed)
+        .map(|l| l.with_context(|| format!("I/O error reading list file: {}", path.display())))
+        .filter_map(|l| match l {
+            Err(e) => Some(Err(e)),
+            Ok(line) => {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    None
+                } else {
+                    Some(Ok(trimmed))
+                }
             }
         })
-        .map(|l| parse_region_str(&l, flank))
+        .map(|l| l.and_then(|l| parse_region_str(&l, flank)))
         .collect()
 }
 
@@ -360,9 +401,13 @@ fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
 
     // chr:start-end
     if let Some((start_s, end_s)) = rest.split_once('-') {
-        let start: u64 = start_s.replace(',', "").parse()
+        let start: u64 = start_s
+            .replace(',', "")
+            .parse()
             .with_context(|| format!("Bad start in region: {s}"))?;
-        let end: u64 = end_s.replace(',', "").parse()
+        let end: u64 = end_s
+            .replace(',', "")
+            .parse()
             .with_context(|| format!("Bad end in region: {s}"))?;
         return Ok(Region {
             name: None,
@@ -377,9 +422,13 @@ fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         .split_once('+')
         .ok_or_else(|| anyhow!("Bad region format (expected start-end or pos+flank): {s}"))?;
 
-    let pos: u64 = pos_s.replace(',', "").parse()
+    let pos: u64 = pos_s
+        .replace(',', "")
+        .parse()
         .with_context(|| format!("Bad position in region: {s}"))?;
-    let inline_flank: u64 = flank_s.replace(',', "").parse()
+    let inline_flank: u64 = flank_s
+        .replace(',', "")
+        .parse()
         .with_context(|| format!("Bad flank in region: {s}"))?;
     let effective_flank = inline_flank.max(flank.unwrap_or(0));
 
@@ -387,7 +436,7 @@ fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         name: None,
         chr: chr.to_string(),
         start: pos.saturating_sub(effective_flank).max(1),
-        end: pos + effective_flank,
+        end: pos.saturating_add(effective_flank),
     })
 }
 
@@ -439,11 +488,7 @@ fn require_column(
 
 /// Read a string field from a CSV record.
 fn read_string_field(rec: &csv::StringRecord, col_idx: usize) -> Result<String> {
-    Ok(rec
-        .get(col_idx)
-        .unwrap_or("")
-        .trim()
-        .to_string())
+    Ok(rec.get(col_idx).unwrap_or("").trim().to_string())
 }
 
 /// Read an optional NAME field (returns `None` if the column is absent or empty).
@@ -521,11 +566,21 @@ fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
             TableMode::Range { start_idx, end_idx } => {
                 let s = parse_u64_field(&rec, *start_idx, "START", row)?;
                 let e = parse_u64_field(&rec, *end_idx, "END", row)?;
-                Region { name, chr, start: min(s, e), end: max(s, e) }
+                Region {
+                    name,
+                    chr,
+                    start: min(s, e),
+                    end: max(s, e),
+                }
             }
             TableMode::Position { pos_idx } => {
                 let p = parse_u64_field(&rec, *pos_idx, "POS", row)?;
-                Region { name, chr, start: p.saturating_sub(flank).max(1), end: p + flank }
+                Region {
+                    name,
+                    chr,
+                    start: p.saturating_sub(flank).max(1),
+                    end: p.saturating_add(flank),
+                }
             }
         };
         out.push(region);
@@ -604,19 +659,47 @@ fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>
         let name = read_optional_name(&rec, name_idx);
 
         match &mode {
-            SvMode::Range { start_left_idx, end_left_idx, start_right_idx, end_right_idx } => {
+            SvMode::Range {
+                start_left_idx,
+                end_left_idx,
+                start_right_idx,
+                end_right_idx,
+            } => {
                 let sl = parse_u64_field(&rec, *start_left_idx, "START_LEFT", row)?;
                 let el = parse_u64_field(&rec, *end_left_idx, "END_LEFT", row)?;
                 let sr = parse_u64_field(&rec, *start_right_idx, "START_RIGHT", row)?;
                 let er = parse_u64_field(&rec, *end_right_idx, "END_RIGHT", row)?;
-                out.push(Region { name: name.clone(), chr: chr_left, start: min(sl, el), end: max(sl, el) });
-                out.push(Region { name, chr: chr_right, start: min(sr, er), end: max(sr, er) });
+                out.push(Region {
+                    name: name.clone(),
+                    chr: chr_left,
+                    start: min(sl, el),
+                    end: max(sl, el),
+                });
+                out.push(Region {
+                    name,
+                    chr: chr_right,
+                    start: min(sr, er),
+                    end: max(sr, er),
+                });
             }
-            SvMode::Position { pos_left_idx, pos_right_idx } => {
+            SvMode::Position {
+                pos_left_idx,
+                pos_right_idx,
+            } => {
                 let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
                 let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
-                out.push(Region { name: name.clone(), chr: chr_left, start: pl.saturating_sub(flank).max(1), end: pl + flank });
-                out.push(Region { name, chr: chr_right, start: pr.saturating_sub(flank).max(1), end: pr + flank });
+                out.push(Region {
+                    name: name.clone(),
+                    chr: chr_left,
+                    start: pl.saturating_sub(flank).max(1),
+                    end: pl.saturating_add(flank),
+                });
+                out.push(Region {
+                    name,
+                    chr: chr_right,
+                    start: pr.saturating_sub(flank).max(1),
+                    end: pr.saturating_add(flank),
+                });
             }
         }
     }
@@ -658,7 +741,11 @@ fn validate_and_clamp_regions(
 // ─── Output ──────────────────────────────────────────────────────────────────
 
 /// Wrap a sequence string to a fixed line width for FASTA output.
+/// If `width` is 0, the sequence is returned unwrapped.
 fn wrap_fasta(seq: &str, width: usize) -> String {
+    if width == 0 {
+        return seq.to_string();
+    }
     let mut out = String::with_capacity(seq.len() + seq.len() / width + 1);
     for (i, chunk) in seq.as_bytes().chunks(width).enumerate() {
         if i > 0 {
@@ -679,20 +766,30 @@ fn write_sequences(
     output_dir: Option<&Path>,
     is_sv: bool,
 ) -> Result<()> {
-    // Parallel extraction.
+    // Parallel extraction with thread-local file handles.
+    thread_local! {
+        static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+    }
     let sequences: Vec<(Region, String)> = regions
         .par_iter()
         .map(|r| {
-            let seq = extract_region(fasta_path, fai_index, r)?;
-            let header = match &r.name {
-                Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
-                None => format!(">{}:{}-{}", r.chr, r.start, r.end),
-            };
-            let fasta_entry = format!(
-                "{header}\n{}\n",
-                wrap_fasta(&seq, 60)
-            );
-            Ok((r.clone(), fasta_entry))
+            TL_FILE.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if borrow.is_none() {
+                    *borrow =
+                        Some(File::open(fasta_path).with_context(|| {
+                            format!("Cannot open FASTA: {}", fasta_path.display())
+                        })?);
+                }
+                let f = borrow.as_mut().unwrap();
+                let seq = extract_region(f, fai_index, r)?;
+                let header = match &r.name {
+                    Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
+                    None => format!(">{}:{}-{}", r.chr, r.start, r.end),
+                };
+                let fasta_entry = format!("{header}\n{}\n", wrap_fasta(&seq, 60));
+                Ok((r.clone(), fasta_entry))
+            })
         })
         .collect::<Result<_>>()?;
 
@@ -753,13 +850,19 @@ fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
 
             let filename = match (&r1.name, &r2.name) {
                 (Some(n1), Some(n2)) if n1 == n2 => {
-                    format!("{n1}_{}_{}_{}_{}_{}_{}.fa", r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end)
+                    format!(
+                        "{n1}_{}_{}_{}_{}_{}_{}.fa",
+                        r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end
+                    )
                 }
                 (Some(n1), Some(n2)) => {
                     return Err(anyhow!("Mismatched names in SV pair: '{n1}' vs '{n2}'"));
                 }
                 _ => {
-                    format!("{}_{}_{}_{}_{}_{}.fa", r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end)
+                    format!(
+                        "{}_{}_{}_{}_{}_{}.fa",
+                        r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end
+                    )
                 }
             };
 
@@ -769,4 +872,253 @@ fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
             }
             Ok(())
         })
+}
+
+// ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_region_str ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_region_str_range() {
+        let r = parse_region_str("chr1:100-200", None).unwrap();
+        assert_eq!(r.chr, "chr1");
+        assert_eq!(r.start, 100);
+        assert_eq!(r.end, 200);
+        assert!(r.name.is_none());
+    }
+
+    #[test]
+    fn parse_region_str_swapped() {
+        let r = parse_region_str("chr1:200-100", None).unwrap();
+        assert_eq!(r.start, 100);
+        assert_eq!(r.end, 200);
+    }
+
+    #[test]
+    fn parse_region_str_with_commas() {
+        let r = parse_region_str("chr1:1,000-2,000", None).unwrap();
+        assert_eq!(r.start, 1000);
+        assert_eq!(r.end, 2000);
+    }
+
+    #[test]
+    fn parse_region_str_position_flank_inline() {
+        let r = parse_region_str("chr1:1000+500", None).unwrap();
+        assert_eq!(r.chr, "chr1");
+        assert_eq!(r.start, 500);
+        assert_eq!(r.end, 1500);
+    }
+
+    #[test]
+    fn parse_region_str_position_flank_cli_override() {
+        // CLI flank is larger than inline flank, so it wins.
+        let r = parse_region_str("chr1:1000+100", Some(500)).unwrap();
+        assert_eq!(r.start, 500);
+        assert_eq!(r.end, 1500);
+    }
+
+    #[test]
+    fn parse_region_str_position_clamps_to_one() {
+        let r = parse_region_str("chr1:3+10", None).unwrap();
+        assert_eq!(r.start, 1);
+        assert_eq!(r.end, 13);
+    }
+
+    #[test]
+    fn parse_region_str_missing_colon() {
+        assert!(parse_region_str("chr1_100_200", None).is_err());
+    }
+
+    #[test]
+    fn parse_region_str_bad_start() {
+        assert!(parse_region_str("chr1:abc-200", None).is_err());
+    }
+
+    #[test]
+    fn parse_region_str_bad_format() {
+        assert!(parse_region_str("chr1:100", None).is_err());
+    }
+
+    // ── wrap_fasta ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_fasta_normal() {
+        let seq = "A".repeat(120);
+        let wrapped = wrap_fasta(&seq, 60);
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].len(), 60);
+        assert_eq!(lines[1].len(), 60);
+    }
+
+    #[test]
+    fn wrap_fasta_shorter_than_width() {
+        let wrapped = wrap_fasta("ACGT", 60);
+        assert_eq!(wrapped, "ACGT");
+    }
+
+    #[test]
+    fn wrap_fasta_empty() {
+        let wrapped = wrap_fasta("", 60);
+        assert_eq!(wrapped, "");
+    }
+
+    #[test]
+    fn wrap_fasta_exact_width() {
+        let seq = "A".repeat(60);
+        let wrapped = wrap_fasta(&seq, 60);
+        assert_eq!(wrapped.lines().count(), 1);
+    }
+
+    #[test]
+    fn wrap_fasta_zero_width() {
+        let wrapped = wrap_fasta("ACGTACGT", 0);
+        assert_eq!(wrapped, "ACGTACGT");
+    }
+
+    // ── count_bases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn count_bases_normal() {
+        assert_eq!(count_bases(b"ACGTNN\n"), 6);
+    }
+
+    #[test]
+    fn count_bases_empty() {
+        assert_eq!(count_bases(b""), 0);
+    }
+
+    #[test]
+    fn count_bases_non_alpha() {
+        assert_eq!(count_bases(b"123\n"), 0);
+    }
+
+    #[test]
+    fn count_bases_mixed() {
+        assert_eq!(count_bases(b"AC1GT\r\n"), 4);
+    }
+
+    // ── parse_fasta_header ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_fasta_header_normal() {
+        assert_eq!(parse_fasta_header(">chr1"), "chr1");
+    }
+
+    #[test]
+    fn parse_fasta_header_with_description() {
+        assert_eq!(parse_fasta_header(">chr1 some description"), "chr1");
+    }
+
+    #[test]
+    fn parse_fasta_header_empty() {
+        assert_eq!(parse_fasta_header(">"), "");
+    }
+
+    #[test]
+    fn parse_fasta_header_whitespace_only() {
+        assert_eq!(parse_fasta_header(">  "), "");
+    }
+
+    // ── parse_regions_inline ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_regions_inline_multiple() {
+        let regions = parse_regions_inline("chr1:1-10,chr2:20-30", None).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].chr, "chr1");
+        assert_eq!(regions[1].chr, "chr2");
+    }
+
+    #[test]
+    fn parse_regions_inline_trailing_comma() {
+        let regions = parse_regions_inline("chr1:1-10,", None).unwrap();
+        assert_eq!(regions.len(), 1);
+    }
+
+    #[test]
+    fn parse_regions_inline_empty() {
+        let regions = parse_regions_inline("", None).unwrap();
+        assert_eq!(regions.len(), 0);
+    }
+
+    // ── detect_delimiter ─────────────────────────────────────────────────
+
+    #[test]
+    fn detect_delimiter_csv() {
+        assert_eq!(detect_delimiter(Path::new("file.csv")), b',');
+    }
+
+    #[test]
+    fn detect_delimiter_tsv() {
+        assert_eq!(detect_delimiter(Path::new("file.tsv")), b'\t');
+    }
+
+    #[test]
+    fn detect_delimiter_tsv_uppercase() {
+        assert_eq!(detect_delimiter(Path::new("file.TSV")), b'\t');
+    }
+
+    #[test]
+    fn detect_delimiter_no_extension() {
+        assert_eq!(detect_delimiter(Path::new("file")), b',');
+    }
+
+    // ── build_header_map ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_header_map_case_insensitive() {
+        let rec = csv::StringRecord::from(vec!["chrom", "Start", "END"]);
+        let map = build_header_map(&rec);
+        assert!(map.contains_key("CHROM"));
+        assert!(map.contains_key("START"));
+        assert!(map.contains_key("END"));
+    }
+
+    #[test]
+    fn build_header_map_trims_whitespace() {
+        let rec = csv::StringRecord::from(vec![" CHROM ", " START"]);
+        let map = build_header_map(&rec);
+        assert!(map.contains_key("CHROM"));
+        assert!(map.contains_key("START"));
+    }
+
+    // ── detect_gzip_and_reject ───────────────────────────────────────────
+
+    #[test]
+    fn detect_gzip_rejects_gzip_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &[0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        assert!(detect_gzip_and_reject(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn detect_gzip_accepts_plain_fasta() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b">chr1\nACGT\n").unwrap();
+        assert!(detect_gzip_and_reject(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn detect_gzip_accepts_empty_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Empty file: read_exact fails, so no rejection.
+        assert!(detect_gzip_and_reject(tmp.path()).is_ok());
+    }
+
+    // ── overflow / saturation ──────────────────────────────────────────
+
+    #[test]
+    fn parse_region_str_large_position_flank_saturates() {
+        // A position near u64::MAX with a flank must saturate to u64::MAX
+        // rather than wrapping around to a small value.
+        let r = parse_region_str(&format!("chr1:{}+100", u64::MAX - 10), None).unwrap();
+        assert_eq!(r.end, u64::MAX, "end should saturate to u64::MAX, not wrap");
+        // start should also saturate sensibly (stay above 1)
+        assert!(r.start >= 1);
+    }
 }

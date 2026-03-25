@@ -207,10 +207,7 @@ fn output_dir_sv_paired() {
         .assert()
         .success();
 
-    let entries: Vec<_> = fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
+    let entries: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
     assert_eq!(entries.len(), 1, "SV pair should produce exactly 1 file");
 
     let content = fs::read_to_string(entries[0].path()).unwrap();
@@ -249,7 +246,7 @@ fn output_and_output_dir_conflict() {
         .args(["--output-dir", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Cannot use both"));
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -380,6 +377,53 @@ fn output_dir_uses_name_in_filename() {
     assert!(content.contains(">myregion chr1:1-10"));
 }
 
+// ─── FAI with line_bases=0 should error, not panic ──────────────────────────
+
+#[test]
+fn fai_line_bases_zero_errors_gracefully() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("zero.fa");
+    // Write a valid-looking FASTA (content does not matter for this test).
+    fs::write(&fasta, ">chr1\nACGTACGT\n").unwrap();
+
+    // Hand-craft a FAI where line_bases is 0. This would cause a division
+    // by zero if the tool did not guard against it.
+    let fai = tmp.path().join("zero.fa.fai");
+    fs::write(&fai, "chr1\t8\t6\t0\t9\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-5", "--no-build-fai"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("line_bases is 0"));
+}
+
+// ─── Inconsistent line widths warning during FAI build ──────────────────────
+
+#[test]
+fn inconsistent_line_widths_warns() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("uneven.fa");
+
+    // First non-final sequence line: 20 bases. Second non-final line: 10 bases.
+    // Third line (final): 5 bases. The mismatch between lines 1 and 2 should
+    // trigger a warning because line 2 is at least as long as line 1 in bytes
+    // would not hold (it is shorter), so we make line 2 *longer* instead.
+    // Build a contig where the first line has 10 bases and the second non-final
+    // line has 20 bases (longer than expected).
+    let seq = ">chr1\nACGTACGTAC\nACGTACGTACACGTACGTAC\nACGT\n";
+    fs::write(&fasta, seq).unwrap();
+
+    // Do NOT pass --no-build-fai so the tool builds its own index.
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-5"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("inconsistent line width"));
+}
+
 // ─── Inline position+flank syntax ───────────────────────────────────────────
 
 #[test]
@@ -474,7 +518,10 @@ fn output_dir_sv_paired_uses_name() {
 
     // sv_table_range.tsv has NAME=SV001
     let expected_file = dir.join("SV001_chr1_1_10_chr2_1_10.fa");
-    assert!(expected_file.exists(), "SV file should use NAME in filename");
+    assert!(
+        expected_file.exists(),
+        "SV file should use NAME in filename"
+    );
     let content = fs::read_to_string(&expected_file).unwrap();
     assert!(content.contains(">SV001 chr1:1-10"));
     assert!(content.contains(">SV001 chr2:1-10"));

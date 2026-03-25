@@ -2,12 +2,12 @@
 name = "multiseqex"
 version = "0.1.0"
 edition = "2024"
-authors = ["Trent Zeng <trentzz.dev@gmail.com>"]
+authors = ["Trent Zeng <dev@trentz.me>"]
 license = "MIT"
 description = "Multi-sequence extractor from FASTA using FAI indexing, with parallelism and flexible region input formats."
 repository = "https://github.com/trentzz/multiseqex"
 homepage = "https://github.com/trentzz/multiseqex"
-documentation = "https://github.com/trentzz/multiseqex"
+documentation = "https://docs.rs/multiseqex"
 readme = "README.md"
 keywords = ["bioinformatics", "fasta", "faidx", "sequence", "parallel"]
 categories = ["science", "command-line-utilities"]

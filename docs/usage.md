@@ -17,6 +17,16 @@ multiseqex ref.fa --regions chr1:1000-2000,chr2:3000-4000 -o out.fa
 multiseqex ref.fa --table regions.csv -o out.fa
 ```
 
+## Coordinate system
+
+All coordinates are **1-based and inclusive on both ends**. A region
+`chr1:100-200` extracts bases 100 through 200 inclusive (101 bases total).
+
+When using position + flank syntax, `chr1:1000+500` means position 1000 with a
+flank of 500 on each side. The resulting region is `chr1:500-1500` (1-based
+inclusive). If the lower bound would fall below 1, it is clamped to 1. If the
+upper bound exceeds the contig length, it is clamped to the contig length.
+
 ## Specifying regions
 
 ### Inline (`--regions`)
@@ -33,7 +43,7 @@ Position + flank syntax is also supported:
 multiseqex ref.fa --regions chr1:1000+500
 ```
 
-This extracts bases 500–1500 (position 1000 ± 500).
+This extracts bases 500 to 1500 inclusive (position 1000 with 500 flanking bases each side).
 
 ### List file (`--list`)
 
