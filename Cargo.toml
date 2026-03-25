@@ -1,6 +1,6 @@
 [package]
 name = "multiseqex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Trent Zeng <dev@trentz.me>"]
 license = "MIT"
@@ -11,7 +11,7 @@ documentation = "https://docs.rs/multiseqex"
 readme = "README.md"
 keywords = ["bioinformatics", "fasta", "faidx", "sequence", "parallel"]
 categories = ["science", "command-line-utilities"]
-exclude = ["docs/", "tests/fixtures/"]
+exclude = ["docs/", "tests/", ".claude/"]
 
 [dependencies]
 anyhow = "1.0.99"
