@@ -2,6 +2,7 @@
 name = "multiseqex"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.87"
 authors = ["Trent Zeng <dev@trentz.me>"]
 license = "MIT"
 description = "Multi-sequence extractor from FASTA using FAI indexing, with parallelism and flexible region input formats."

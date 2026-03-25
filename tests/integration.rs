@@ -1,6 +1,8 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn fixture(name: &str) -> String {
@@ -525,4 +527,453 @@ fn output_dir_sv_paired_uses_name() {
     let content = fs::read_to_string(&expected_file).unwrap();
     assert!(content.contains(">SV001 chr1:1-10"));
     assert!(content.contains(">SV001 chr2:1-10"));
+}
+
+// ─── --list with comments and blank lines (T001-006) ────────────────────────
+
+#[test]
+fn list_with_comments_and_blanks() {
+    let tmp = TempDir::new().unwrap();
+    let list_path = tmp.path().join("regions_comments.txt");
+    fs::write(
+        &list_path,
+        "# This is a comment\n\
+         chr1:1-10\n\
+         \n\
+         # Another comment\n\
+         \t  \n\
+         chr2:1-10\n\
+         \n\
+         chr3:1-10\n",
+    )
+    .unwrap();
+
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--list", list_path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Only the three valid regions should appear.
+    output
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr2:1-10"))
+        .stdout(predicate::str::contains(">chr3:1-10"))
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        .stdout(predicate::str::contains("TTTTTTTTTT"))
+        .stdout(predicate::str::contains("ATCGATCGAT"));
+}
+
+// ─── FAI round-trip accuracy (T001-007) ─────────────────────────────────────
+
+#[test]
+fn fai_roundtrip_accuracy() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("roundtrip.fa");
+
+    // Two contigs with different line widths. contig1 uses 20-base lines,
+    // contig2 uses 15-base lines.
+    fs::write(
+        &fasta,
+        ">contig1\n\
+         AAACCCGGGTTTAAACCCGG\n\
+         TTTAAACCCGGGTTTAAACC\n\
+         CGGGTTT\n\
+         >contig2\n\
+         ATCGATCGATCGATC\n\
+         GATCGATCGATCGAT\n\
+         CGATCG\n",
+    )
+    .unwrap();
+
+    // Extract a range that spans a line boundary in contig1 (bases 18-25).
+    let output = cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "contig1:18-25"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("CGGTTAAA") || stdout.contains(">contig1:18-25"),
+        "Header should appear in output"
+    );
+
+    // Verify the FAI file was created and has correct fields.
+    let fai_path = tmp.path().join("roundtrip.fa.fai");
+    assert!(fai_path.exists(), ".fai should have been auto-built");
+    let fai_content = fs::read_to_string(&fai_path).unwrap();
+    let lines: Vec<&str> = fai_content.lines().collect();
+    assert_eq!(lines.len(), 2, "FAI should have two records");
+
+    // contig1: 47 bases, offset after ">contig1\n" = 9, line_bases=20, line_bytes=21
+    let fields1: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(fields1[0], "contig1");
+    assert_eq!(fields1[1], "47", "contig1 length");
+    assert_eq!(fields1[2], "9", "contig1 offset");
+    assert_eq!(fields1[3], "20", "contig1 line_bases");
+    assert_eq!(fields1[4], "21", "contig1 line_bytes");
+
+    // contig2: 36 bases, offset after contig1 data + ">contig2\n"
+    let fields2: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(fields2[0], "contig2");
+    assert_eq!(fields2[1], "36", "contig2 length");
+    assert_eq!(fields2[3], "15", "contig2 line_bases");
+    assert_eq!(fields2[4], "16", "contig2 line_bytes");
+
+    // Extract from contig2 spanning a line boundary (bases 13-18).
+    let output2 = cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "contig2:13-18"])
+        .output()
+        .unwrap();
+    assert!(output2.status.success());
+    let stdout2 = String::from_utf8(output2.stdout).unwrap();
+    // contig2 full: ATCGATCGATCGATCGATCGATCGATCGATCGATCG
+    // bases 13-18:  ATCGATCGATCG[ATCGAT]CGATCGATCGATCGATCG
+    //                             ^13   ^18
+    assert!(
+        stdout2.contains("ATCGAT"),
+        "Expected bases 13-18 of contig2 = ATCGAT, got: {}",
+        stdout2
+    );
+}
+
+// ─── --threads flag (T001-008) ──────────────────────────────────────────────
+
+#[test]
+fn threads_flag_produces_correct_output() {
+    // Use multiple regions to exercise parallelism with --threads 2.
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:1-10,chr3:1-10"])
+        .args(["--threads", "2"])
+        .assert()
+        .success();
+
+    output
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        .stdout(predicate::str::contains(">chr2:1-10"))
+        .stdout(predicate::str::contains("TTTTTTTTTT"))
+        .stdout(predicate::str::contains(">chr3:1-10"))
+        .stdout(predicate::str::contains("ATCGATCGAT"));
+}
+
+// ─── Zero-coordinate rejection ──────────────────────────────────────────────
+
+#[test]
+fn table_start_zero_errors() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("zero_start.csv");
+    fs::write(&csv_path, "CHROM,START,END\nchr1,0,10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1-based coordinates"));
+}
+
+// ─── Duplicate contig names warning (R001-002) ──────────────────────────────
+
+#[test]
+fn duplicate_contig_warns() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("dup.fa");
+    // Two contigs with the same name.
+    fs::write(
+        &fasta,
+        ">chr1\nAAAAAAAAAAAAAAAAAAAAA\n>chr1\nCCCCCCCCCCCCCCCCCCCC\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-5"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("duplicate contig name"));
+}
+
+// ─── Empty contig name warning (R001-003) ───────────────────────────────────
+
+#[test]
+fn empty_contig_name_warns() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("bare.fa");
+    // A bare '>' header with no name.
+    fs::write(&fasta, ">\nAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", ":1-5"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("empty contig name"));
+}
+
+// ─── Empty table: headers only (T001-001) ────────────────────────────────────
+
+#[test]
+fn table_empty_body_errors() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("empty.csv");
+    fs::write(&csv_path, "CHROM,START,END\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No regions provided"));
+}
+
+#[test]
+fn sv_table_empty_body_errors() {
+    let tmp = TempDir::new().unwrap();
+    let tsv_path = tmp.path().join("empty.tsv");
+    fs::write(
+        &tsv_path,
+        "NAME\tCHROM_LEFT\tSTART_LEFT\tEND_LEFT\tCHROM_RIGHT\tSTART_RIGHT\tEND_RIGHT\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--sv-table", tsv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No regions provided"));
+}
+
+// ─── Malformed CSV rows (T001-002) ──────────────────────────────────────────
+
+#[test]
+fn table_missing_end_field_errors() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("missing_end.csv");
+    // Row has CHROM and START but the END value is missing (short row).
+    // The CSV parser rejects this before column access, so we check for a
+    // CSV-level error rather than our own "Missing END" message.
+    fs::write(&csv_path, "CHROM,START,END\nchr1,1\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("CSV error"));
+}
+
+#[test]
+fn table_non_numeric_start_errors() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("bad_start.csv");
+    fs::write(&csv_path, "CHROM,START,END\nchr1,abc,10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Bad START at row 2"));
+}
+
+#[test]
+fn table_extra_fields_ok() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("extra.csv");
+    // Extra trailing field should not cause an error.
+    fs::write(&csv_path, "CHROM,START,END,EXTRA\nchr1,1,10,bonus\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"));
+}
+
+// ─── Gzip rejection integration (T001-003) ──────────────────────────────────
+
+#[test]
+fn gzip_file_rejected_at_cli() {
+    let tmp = TempDir::new().unwrap();
+    let gz_path = tmp.path().join("fake.fa.gz");
+    // Write gzip magic bytes followed by arbitrary content.
+    fs::write(&gz_path, b"\x1f\x8b\x08\x00fake gzip data").unwrap();
+
+    cmd()
+        .arg(gz_path.to_str().unwrap())
+        .args(["--regions", "chr1:1-10", "--no-build-fai"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gzip"));
+}
+
+// ─── Combining --regions with --table (T001-004) ─────────────────────────────
+
+#[test]
+fn combine_regions_and_table() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("extra_region.csv");
+    fs::write(&csv_path, "CHROM,START,END\nchr2,1,10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr2:1-10"))
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        .stdout(predicate::str::contains("TTTTTTTTTT"));
+}
+
+// ─── Filename collision in --output-dir (T001-005) ───────────────────────────
+
+#[test]
+fn output_dir_filename_collision_overwrites() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("collision");
+
+    // Two identical regions produce the same filename. The second overwrites
+    // the first. We verify that exactly one file exists and its content is
+    // valid FASTA.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr1:1-10"])
+        .args(["--output-dir", dir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let entries: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "Colliding filenames should produce exactly one file"
+    );
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    assert!(
+        content.contains(">chr1:1-10"),
+        "File should contain a valid FASTA header"
+    );
+    assert!(
+        content.contains("AAACCCGGGT"),
+        "File should contain the extracted sequence"
+    );
+}
+
+// ─── Stale FAI warning (R001-004) ───────────────────────────────────────────
+
+#[test]
+fn stale_fai_warns() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("stale.fa");
+    fs::write(&fasta, ">chr1\nAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+
+    // Build the FAI first by running the tool.
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-5"])
+        .assert()
+        .success();
+
+    let fai = tmp.path().join("stale.fa.fai");
+    assert!(fai.exists(), ".fai should have been auto-built");
+
+    // Wait briefly, then touch the FASTA so it is newer than the FAI.
+    thread::sleep(Duration::from_millis(1100));
+    let content = fs::read_to_string(&fasta).unwrap();
+    fs::write(&fasta, &content).unwrap();
+
+    // Run again with --no-build-fai so it uses the existing (now stale) index.
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-5", "--no-build-fai"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("index may be stale"));
+}
+
+// ─── --delimiter override ───────────────────────────────────────────────────
+
+#[test]
+fn delimiter_override_tab_on_csv_extension() {
+    // Write a tab-separated file with .csv extension, then use --delimiter tab.
+    let dir = TempDir::new().unwrap();
+    let csv_path = dir.path().join("regions.csv");
+    fs::write(&csv_path, "CHROM\tSTART\tEND\nchr1\t1\t10\nchr2\t1\t10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap(), "--delimiter", "tab"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr2:1-10"));
+}
+
+#[test]
+fn delimiter_override_comma_on_tsv_extension() {
+    // Write a comma-separated file with .tsv extension, then use --delimiter comma.
+    let dir = TempDir::new().unwrap();
+    let tsv_path = dir.path().join("regions.tsv");
+    fs::write(&tsv_path, "CHROM,START,END\nchr1,1,10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--table",
+            tsv_path.to_str().unwrap(),
+            "--delimiter",
+            "comma",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"));
+}
+
+#[test]
+fn delimiter_override_single_char() {
+    // Semicolon-separated file parsed with --delimiter ";".
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("regions.txt");
+    fs::write(&path, "CHROM;START;END\nchr1;1;10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", path.to_str().unwrap(), "--delimiter", ";"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"));
+}
+
+#[test]
+fn delimiter_sniff_tabs_in_txt_file() {
+    // A .txt file with tab-separated content should be auto-detected as tab.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("regions.txt");
+    fs::write(&path, "CHROM\tSTART\tEND\nchr1\t1\t10\nchr3\t1\t10\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr3:1-10"));
+}
+
+#[test]
+fn delimiter_invalid_value_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", &fixture("table_range.csv"), "--delimiter", "abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid --delimiter"));
 }

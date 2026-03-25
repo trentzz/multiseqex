@@ -59,7 +59,8 @@ struct Cli {
     /// Range mode: CHROM, START, END.
     /// Position mode: CHROM, POS (requires --flank).
     /// Optional: NAME.
-    /// Extra columns are ignored. Delimiter auto-detected (.tsv → tab, else comma).
+    /// Extra columns are ignored. Delimiter auto-detected (.tsv → tab, else sniff
+    /// for tabs, else comma). Use --delimiter to override.
     #[arg(long)]
     table: Option<PathBuf>,
 
@@ -89,6 +90,14 @@ struct Cli {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Override delimiter for --table / --sv-table.
+    ///
+    /// Accepts "tab", "comma", or a single character (e.g. ";").
+    /// When omitted the delimiter is auto-detected: .tsv → tab,
+    /// otherwise the first line is sniffed for tabs, falling back to comma.
+    #[arg(long)]
+    delimiter: Option<String>,
+
     /// Error if .fai is missing instead of building one automatically.
     #[arg(long)]
     no_build_fai: bool,
@@ -112,6 +121,7 @@ fn main() -> Result<()> {
 
     // Ensure .fai exists (or build it).
     let fai_path = fai_path_for(&cli.fasta);
+    let mut fai_just_built = false;
     if !fai_path.exists() {
         if cli.no_build_fai {
             return Err(anyhow!(
@@ -121,7 +131,14 @@ fn main() -> Result<()> {
         }
         eprintln!("Index not found. Building FAI: {}", fai_path.display());
         build_fai(&cli.fasta, &fai_path)?;
+        fai_just_built = true;
     }
+
+    // If the FAI already existed, check whether it is older than the FASTA.
+    if !fai_just_built {
+        check_fai_staleness(&cli.fasta, &fai_path);
+    }
+
     let fai_index = read_fai(&fai_path)?;
 
     // Collect regions from all input sources.
@@ -133,10 +150,14 @@ fn main() -> Result<()> {
         regions.extend(parse_regions_list(p, cli.flank)?);
     }
     if let Some(p) = cli.table.as_ref() {
-        regions.extend(parse_regions_table(p, cli.flank)?);
+        regions.extend(parse_regions_table(p, cli.flank, cli.delimiter.as_deref())?);
     }
     if let Some(p) = cli.sv_table.as_ref() {
-        regions.extend(parse_regions_sv_table(p, cli.flank)?);
+        regions.extend(parse_regions_sv_table(
+            p,
+            cli.flank,
+            cli.delimiter.as_deref(),
+        )?);
     }
 
     if regions.is_empty() {
@@ -186,6 +207,23 @@ fn fai_path_for(fasta: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Warn if the FAI file is older than the FASTA file, suggesting it may be stale.
+fn check_fai_staleness(fasta: &Path, fai: &Path) {
+    let fasta_mtime = std::fs::metadata(fasta).and_then(|m| m.modified());
+    let fai_mtime = std::fs::metadata(fai).and_then(|m| m.modified());
+
+    if let (Ok(fasta_t), Ok(fai_t)) = (fasta_mtime, fai_mtime)
+        && fai_t < fasta_t
+    {
+        eprintln!(
+            "Warning: FAI index '{}' is older than FASTA '{}'. \
+             The index may be stale. Consider rebuilding it.",
+            fai.display(),
+            fasta.display()
+        );
+    }
+}
+
 /// Build a minimal `.fai` index from a FASTA file.
 fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
     let f = File::open(fasta)
@@ -225,7 +263,14 @@ fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
 
         if raw.starts_with(b">") {
             // New contig header — flush the previous one.
-            if let Some(name) = current_name.replace(parse_fasta_header(&line)) {
+            let header_name = parse_fasta_header(&line);
+            if header_name.is_empty() {
+                eprintln!(
+                    "Warning: empty contig name at byte offset {}. Header line is bare '>' or '>  '.",
+                    pos
+                );
+            }
+            if let Some(name) = current_name.replace(header_name) {
                 writeln!(
                     out,
                     "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}"
@@ -297,8 +342,16 @@ fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
         if parts.len() < 5 {
             return Err(anyhow!("Malformed FAI line {}: {}", i + 1, line));
         }
+        let contig_name = parts[0].to_string();
+        if map.contains_key(&contig_name) {
+            eprintln!(
+                "Warning: duplicate contig name '{}' in FAI (line {}). Earlier entry will be overwritten.",
+                contig_name,
+                i + 1
+            );
+        }
         map.insert(
-            parts[0].to_string(),
+            contig_name,
             FaiRecord {
                 length: parts[1]
                     .parse()
@@ -471,12 +524,60 @@ fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
 }
 
 /// Auto-detect CSV/TSV delimiter from file extension.
-fn detect_delimiter(path: &Path) -> u8 {
+/// Parse a user-supplied delimiter string into a byte.
+///
+/// Accepts "tab", "comma", or a single ASCII character.
+fn parse_delimiter_flag(s: &str) -> Result<u8> {
+    match s.to_ascii_lowercase().as_str() {
+        "tab" => Ok(b'\t'),
+        "comma" => Ok(b','),
+        _ => {
+            let bytes = s.as_bytes();
+            if bytes.len() == 1 {
+                Ok(bytes[0])
+            } else {
+                Err(anyhow!(
+                    "Invalid --delimiter value \"{s}\": expected \"tab\", \"comma\", or a single character"
+                ))
+            }
+        }
+    }
+}
+
+/// Detect the delimiter for a table file.
+///
+/// Priority:
+/// 1. Explicit override from `--delimiter`.
+/// 2. File extension: `.tsv` → tab.
+/// 3. Content sniffing: if the first line contains a tab, use tab.
+/// 4. Default to comma.
+fn detect_delimiter(path: &Path, cli_delimiter: Option<&str>) -> Result<u8> {
+    // 1. Explicit override.
+    if let Some(s) = cli_delimiter {
+        return parse_delimiter_flag(s);
+    }
+
+    // 2. Extension check.
     let is_tsv = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("tsv"));
-    if is_tsv { b'\t' } else { b',' }
+    if is_tsv {
+        return Ok(b'\t');
+    }
+
+    // 3. Sniff the first line for tabs.
+    if let Ok(file) = File::open(path) {
+        let reader = BufReader::new(file);
+        if let Some(Ok(first_line)) = reader.lines().next() {
+            if first_line.contains('\t') {
+                return Ok(b'\t');
+            }
+        }
+    }
+
+    // 4. Default to comma.
+    Ok(b',')
 }
 
 /// Parse a numeric field from a CSV record, with a contextual error message.
@@ -525,8 +626,12 @@ enum TableMode {
 }
 
 /// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME.
-fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = detect_delimiter(path);
+fn parse_regions_table(
+    path: &Path,
+    flank: Option<u64>,
+    cli_delimiter: Option<&str>,
+) -> Result<Vec<Region>> {
+    let delim = detect_delimiter(path, cli_delimiter)?;
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
@@ -638,8 +743,12 @@ enum SvMode {
 }
 
 /// Parse a CSV/TSV SV table with named columns.
-fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = detect_delimiter(path);
+fn parse_regions_sv_table(
+    path: &Path,
+    flank: Option<u64>,
+    cli_delimiter: Option<&str>,
+) -> Result<Vec<Region>> {
+    let delim = detect_delimiter(path, cli_delimiter)?;
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delim)
@@ -737,6 +846,14 @@ fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>
             } => {
                 let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
                 let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
+                // Coordinates are 1-based; reject zero values.
+                for (val, label) in [(pl, "POS_LEFT"), (pr, "POS_RIGHT")] {
+                    if val == 0 {
+                        return Err(anyhow!(
+                            "{label} must be >= 1 (1-based coordinates) at row {row}"
+                        ));
+                    }
+                }
                 out.push(Region {
                     name: name.clone(),
                     chr: chr_left,
@@ -1099,22 +1216,75 @@ mod tests {
 
     #[test]
     fn detect_delimiter_csv() {
-        assert_eq!(detect_delimiter(Path::new("file.csv")), b',');
+        assert_eq!(detect_delimiter(Path::new("file.csv"), None).unwrap(), b',');
     }
 
     #[test]
     fn detect_delimiter_tsv() {
-        assert_eq!(detect_delimiter(Path::new("file.tsv")), b'\t');
+        assert_eq!(
+            detect_delimiter(Path::new("file.tsv"), None).unwrap(),
+            b'\t'
+        );
     }
 
     #[test]
     fn detect_delimiter_tsv_uppercase() {
-        assert_eq!(detect_delimiter(Path::new("file.TSV")), b'\t');
+        assert_eq!(
+            detect_delimiter(Path::new("file.TSV"), None).unwrap(),
+            b'\t'
+        );
     }
 
     #[test]
     fn detect_delimiter_no_extension() {
-        assert_eq!(detect_delimiter(Path::new("file")), b',');
+        assert_eq!(detect_delimiter(Path::new("file"), None).unwrap(), b',');
+    }
+
+    #[test]
+    fn detect_delimiter_sniff_tabs_in_txt() {
+        // A .txt file whose first line contains tabs should be detected as tab-delimited.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "CHROM\tSTART\tEND\nchr1\t1\t10\n").unwrap();
+        assert_eq!(detect_delimiter(&path, None).unwrap(), b'\t');
+    }
+
+    #[test]
+    fn detect_delimiter_sniff_comma_in_txt() {
+        // A .txt file with no tabs defaults to comma.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "CHROM,START,END\nchr1,1,10\n").unwrap();
+        assert_eq!(detect_delimiter(&path, None).unwrap(), b',');
+    }
+
+    #[test]
+    fn detect_delimiter_cli_override_tab() {
+        assert_eq!(
+            detect_delimiter(Path::new("file.csv"), Some("tab")).unwrap(),
+            b'\t'
+        );
+    }
+
+    #[test]
+    fn detect_delimiter_cli_override_comma() {
+        assert_eq!(
+            detect_delimiter(Path::new("file.tsv"), Some("comma")).unwrap(),
+            b','
+        );
+    }
+
+    #[test]
+    fn detect_delimiter_cli_override_single_char() {
+        assert_eq!(
+            detect_delimiter(Path::new("file.csv"), Some(";")).unwrap(),
+            b';'
+        );
+    }
+
+    #[test]
+    fn detect_delimiter_cli_override_invalid() {
+        assert!(detect_delimiter(Path::new("file.csv"), Some("abc")).is_err());
     }
 
     // ── build_header_map ─────────────────────────────────────────────────
@@ -1169,5 +1339,62 @@ mod tests {
         assert_eq!(r.end, u64::MAX, "end should saturate to u64::MAX, not wrap");
         // start should also saturate sensibly (stay above 1)
         assert!(r.start >= 1);
+    }
+
+    // ── zero-coordinate rejection ─────────────────────────────────────────
+
+    #[test]
+    fn parse_region_str_zero_start_errors() {
+        let err = parse_region_str("chr1:0-10", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1-based coordinates"),
+            "expected 1-based coordinates message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_region_str_zero_end_errors() {
+        let err = parse_region_str("chr1:10-0", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1-based coordinates"),
+            "expected 1-based coordinates message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_region_zero_start_errors() {
+        use std::io::Write;
+        // Build a minimal FASTA file and FAI index for the test.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, ">chr1\nACGTACGT\n").unwrap();
+        tmp.flush().unwrap();
+
+        let mut fai = HashMap::new();
+        fai.insert(
+            "chr1".to_string(),
+            FaiRecord {
+                length: 8,
+                offset: 6,
+                line_bases: 8,
+                line_bytes: 9,
+            },
+        );
+
+        let r = Region {
+            name: None,
+            chr: "chr1".to_string(),
+            start: 0,
+            end: 5,
+        };
+
+        let mut f = File::open(tmp.path()).unwrap();
+        let err = extract_region(&mut f, &fai, &r).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1-based coordinates"),
+            "expected 1-based coordinates message, got: {msg}"
+        );
     }
 }
