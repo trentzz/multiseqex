@@ -49,7 +49,14 @@ multiseqex ref.fa --sv-table variants.tsv --output-dir sv_seqs/
 
 # One file per region
 multiseqex ref.fa --table regions.csv --output-dir per_region/
+
+# Combine inline regions with a table
+multiseqex ref.fa --regions chr1:1000-2000 --table extra.csv -o out.fa
 ```
+
+> **Note:** `--regions`, `--list`, and `--table` can be freely combined in a
+> single invocation. All regions from every source are merged and extracted
+> together.
 
 ## Table formats
 

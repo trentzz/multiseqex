@@ -323,6 +323,14 @@ fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
 /// Extract a region from a FASTA file using the FAI index.
 /// Accepts a mutable file handle to allow reuse across calls on the same thread.
 fn extract_region(f: &mut File, fai: &HashMap<String, FaiRecord>, r: &Region) -> Result<String> {
+    // Coordinates are 1-based; zero is never valid.
+    if r.start == 0 {
+        return Err(anyhow!(
+            "region start must be >= 1 (1-based coordinates), got 0 for '{}'",
+            r.chr
+        ));
+    }
+
     let rec = fai
         .get(&r.chr)
         .ok_or_else(|| anyhow!("Contig '{}' not in index", r.chr))?;
@@ -409,6 +417,17 @@ fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
             .replace(',', "")
             .parse()
             .with_context(|| format!("Bad end in region: {s}"))?;
+        // Coordinates are 1-based; reject zero values.
+        if start == 0 {
+            return Err(anyhow!(
+                "start must be >= 1 (1-based coordinates) in region: {s}"
+            ));
+        }
+        if end == 0 {
+            return Err(anyhow!(
+                "end must be >= 1 (1-based coordinates) in region: {s}"
+            ));
+        }
         return Ok(Region {
             name: None,
             chr: chr.to_string(),
@@ -566,6 +585,17 @@ fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
             TableMode::Range { start_idx, end_idx } => {
                 let s = parse_u64_field(&rec, *start_idx, "START", row)?;
                 let e = parse_u64_field(&rec, *end_idx, "END", row)?;
+                // Coordinates are 1-based; reject zero values.
+                if s == 0 {
+                    return Err(anyhow!(
+                        "START must be >= 1 (1-based coordinates) at row {row}"
+                    ));
+                }
+                if e == 0 {
+                    return Err(anyhow!(
+                        "END must be >= 1 (1-based coordinates) at row {row}"
+                    ));
+                }
                 Region {
                     name,
                     chr,
@@ -575,6 +605,12 @@ fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
             }
             TableMode::Position { pos_idx } => {
                 let p = parse_u64_field(&rec, *pos_idx, "POS", row)?;
+                // Coordinates are 1-based; reject zero values.
+                if p == 0 {
+                    return Err(anyhow!(
+                        "POS must be >= 1 (1-based coordinates) at row {row}"
+                    ));
+                }
                 Region {
                     name,
                     chr,
@@ -669,6 +705,19 @@ fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>
                 let el = parse_u64_field(&rec, *end_left_idx, "END_LEFT", row)?;
                 let sr = parse_u64_field(&rec, *start_right_idx, "START_RIGHT", row)?;
                 let er = parse_u64_field(&rec, *end_right_idx, "END_RIGHT", row)?;
+                // Coordinates are 1-based; reject zero values.
+                for (val, label) in [
+                    (sl, "START_LEFT"),
+                    (el, "END_LEFT"),
+                    (sr, "START_RIGHT"),
+                    (er, "END_RIGHT"),
+                ] {
+                    if val == 0 {
+                        return Err(anyhow!(
+                            "{label} must be >= 1 (1-based coordinates) at row {row}"
+                        ));
+                    }
+                }
                 out.push(Region {
                     name: name.clone(),
                     chr: chr_left,
@@ -1092,7 +1141,7 @@ mod tests {
     #[test]
     fn detect_gzip_rejects_gzip_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), &[0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        std::fs::write(tmp.path(), [0x1f, 0x8b, 0x08, 0x00]).unwrap();
         assert!(detect_gzip_and_reject(tmp.path()).is_err());
     }
 

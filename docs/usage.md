@@ -117,6 +117,27 @@ chr1,1500,chr3,5500
 multiseqex ref.fa --sv-table sv_positions.csv --flank 1000
 ```
 
+## Combining input sources
+
+`--regions`, `--list`, and `--table` can be freely combined. All regions from
+every source are merged into a single extraction. This is useful when you have
+a base set of regions in a file but need to add a few extra on the command line.
+
+```bash
+# Combine a table with extra inline regions
+multiseqex ref.fa --table regions.csv --regions chr5:100-200 -o out.fa
+
+# Combine a list file with a table
+multiseqex ref.fa --list regions.txt --table extra.csv -o out.fa
+
+# All three at once
+multiseqex ref.fa --regions chr1:1-500 --list regions.txt --table extra.csv -o out.fa
+```
+
+`--sv-table` can also be combined with the other sources. Regions from
+`--sv-table` (left and right breakpoints) are merged alongside any regions from
+`--regions`, `--list`, or `--table`.
+
 ## Output options
 
 | Flag | Behaviour |
