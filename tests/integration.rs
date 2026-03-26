@@ -1511,3 +1511,404 @@ fn flank_left_without_right_errors() {
             "--flank-left and --flank-right must be specified together",
         ));
 }
+
+// ─── Feature 4: VCF input (--vcf) ─────────────────────────────────────────
+
+#[test]
+fn vcf_snp_extraction() {
+    let tmp = TempDir::new().unwrap();
+    let vcf_path = tmp.path().join("test.vcf");
+    fs::write(
+        &vcf_path,
+        "##fileformat=VCFv4.2\n\
+         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+         chr1\t5\trs123\tA\tG\t.\t.\t.\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--vcf", vcf_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">rs123 chr1:5-5 REF=A ALT=G"));
+}
+
+#[test]
+fn vcf_deletion_spans_ref_length() {
+    let tmp = TempDir::new().unwrap();
+    let vcf_path = tmp.path().join("del.vcf");
+    // REF=ACGT (4 bases), so region should be POS..POS+3 = 10..13.
+    fs::write(&vcf_path, "chr1\t10\tvar1\tACGT\tA\t.\t.\t.\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--vcf", vcf_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">var1 chr1:10-13 REF=ACGT ALT=A"));
+}
+
+#[test]
+fn vcf_with_flank() {
+    let tmp = TempDir::new().unwrap();
+    let vcf_path = tmp.path().join("flank.vcf");
+    fs::write(&vcf_path, "chr1\t50\t.\tA\tG\t.\t.\t.\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--vcf", vcf_path.to_str().unwrap(), "--flank", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:40-60"));
+}
+
+#[test]
+fn vcf_dot_id_gives_no_name() {
+    let tmp = TempDir::new().unwrap();
+    let vcf_path = tmp.path().join("dot.vcf");
+    fs::write(&vcf_path, "chr1\t5\t.\tA\tG\t.\t.\t.\n").unwrap();
+
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--vcf", vcf_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Header should not have a name prefix, just coordinates.
+    assert!(stdout.contains(">chr1:5-5 REF=A ALT=G"));
+}
+
+#[test]
+fn vcf_conflicts_with_sv_table() {
+    let tmp = TempDir::new().unwrap();
+    let vcf_path = tmp.path().join("test.vcf");
+    fs::write(&vcf_path, "chr1\t5\trs1\tA\tG\t.\t.\t.\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            vcf_path.to_str().unwrap(),
+            "--sv-table",
+            &fixture("sv_table_range.tsv"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+// ─── Feature 8: GFF3/GTF input (--gff) ────────────────────────────────────
+
+#[test]
+fn gff_gene_extraction() {
+    let tmp = TempDir::new().unwrap();
+    let gff_path = tmp.path().join("test.gff3");
+    fs::write(
+        &gff_path,
+        "##gff-version 3\n\
+         chr1\t.\tgene\t1\t10\t.\t+\t.\tID=gene1;Name=TP53\n\
+         chr1\t.\texon\t1\t5\t.\t+\t.\tParent=gene1\n\
+         chr2\t.\tgene\t1\t10\t.\t-\t.\tID=gene2;Name=BRCA1\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--gff", gff_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">TP53 chr1:1-10(+)"))
+        .stdout(predicate::str::contains(">BRCA1 chr2:1-10(-)"));
+}
+
+#[test]
+fn gff_exon_filter() {
+    let tmp = TempDir::new().unwrap();
+    let gff_path = tmp.path().join("exon.gff3");
+    fs::write(
+        &gff_path,
+        "chr1\t.\tgene\t1\t20\t.\t+\t.\tName=gene1\n\
+         chr1\t.\texon\t1\t10\t.\t+\t.\tName=exon1\n\
+         chr1\t.\texon\t15\t20\t.\t+\t.\tName=exon2\n",
+    )
+    .unwrap();
+
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--gff", gff_path.to_str().unwrap(), "--gff-feature", "exon"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(headers.len(), 2);
+    assert!(stdout.contains(">exon1"));
+    assert!(stdout.contains(">exon2"));
+}
+
+#[test]
+fn gff_with_flank() {
+    let tmp = TempDir::new().unwrap();
+    let gff_path = tmp.path().join("flank.gff3");
+    fs::write(&gff_path, "chr1\t.\tgene\t50\t60\t.\t+\t.\tName=g1\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--gff", gff_path.to_str().unwrap(), "--flank", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">g1 chr1:40-70(+)"));
+}
+
+#[test]
+fn gff_minus_strand_reverse_complements() {
+    let tmp = TempDir::new().unwrap();
+    let gff_path = tmp.path().join("strand.gff3");
+    // chr1:1-10 = AAACCCGGGT. Minus strand RC = ACCCGGGTTT.
+    fs::write(&gff_path, "chr1\t.\tgene\t1\t10\t.\t-\t.\tName=g1\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--gff", gff_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACCCGGGTTT"));
+}
+
+#[test]
+fn gff_conflicts_with_sv_table() {
+    let tmp = TempDir::new().unwrap();
+    let gff_path = tmp.path().join("test.gff3");
+    fs::write(&gff_path, "chr1\t.\tgene\t1\t10\t.\t+\t.\tName=g1\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--gff",
+            gff_path.to_str().unwrap(),
+            "--sv-table",
+            &fixture("sv_table_range.tsv"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn gff_feature_requires_gff() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--gff-feature", "exon"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--gff-feature"));
+}
+
+// ─── Feature 10: FASTQ output (--fastq) ───────────────────────────────────
+
+#[test]
+fn fastq_output() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--fastq"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].starts_with('@'));
+    assert!(lines[0].contains("chr1:1-10"));
+    assert_eq!(lines[1], "AAACCCGGGT");
+    assert_eq!(lines[2], "+");
+    assert_eq!(lines[3], "IIIIIIIIII"); // 10 I's for 10 bases
+}
+
+#[test]
+fn fastq_custom_qual() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-5", "--fastq", "--qual", "J"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[3], "JJJJJ");
+}
+
+#[test]
+fn fastq_conflicts_with_tab_out() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--fastq", "--tab-out"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn qual_requires_fastq() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--qual", "J"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--fastq"));
+}
+
+// ─── Feature 11: Statistics mode (--stats) ─────────────────────────────────
+
+#[test]
+fn stats_basic() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--stats"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    // First line is header.
+    assert!(lines[0].contains("chr\tstart\tend\tname\tlength\tgc_percent\tn_count\tmasked_count"));
+    // Second line is data.
+    let fields: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(fields[0], "chr1");
+    assert_eq!(fields[1], "1");
+    assert_eq!(fields[2], "10");
+    assert_eq!(fields[3], "."); // no name
+    assert_eq!(fields[4], "10"); // length
+}
+
+#[test]
+fn stats_multiple_regions() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:1-10", "--stats"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3); // header + 2 data rows
+}
+
+#[test]
+fn stats_conflicts_with_output() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out.fa");
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--stats",
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn stats_conflicts_with_fastq() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--stats", "--fastq"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+// ─── Feature 12: Name templating (--name-template) ─────────────────────────
+
+#[test]
+fn name_template_basic() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--name-template",
+            "{chr}_{start}_{end}_idx{index}",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(">chr1_1_10_idx1"));
+}
+
+#[test]
+fn name_template_with_named_region() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("named.csv");
+    fs::write(&csv_path, "CHROM,START,END,NAME\nchr1,1,10,mygene\n").unwrap();
+
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--table",
+            csv_path.to_str().unwrap(),
+            "--name-template",
+            "{name}|{chr}:{start}-{end}|len={length}",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(">mygene|chr1:1-10|len=10"));
+}
+
+#[test]
+fn name_template_with_fastq() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-5",
+            "--fastq",
+            "--name-template",
+            "seq_{index}",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("@seq_1"));
+}
+
+#[test]
+fn name_template_conflicts_with_tab_out() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--tab-out",
+            "--name-template",
+            "{chr}",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn name_template_conflicts_with_stats() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--stats",
+            "--name-template",
+            "{chr}",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}

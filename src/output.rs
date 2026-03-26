@@ -10,6 +10,20 @@ use std::sync::Mutex;
 use crate::extract::{build_bulk_groups, extract_bulk_group, extract_region, reverse_complement};
 use crate::fai::FaiRecord;
 use crate::region::Region;
+use crate::template::expand_template;
+
+/// Output format configuration.
+#[derive(Debug, Clone, Default)]
+pub struct OutputConfig {
+    /// Emit FASTQ instead of FASTA.
+    pub fastq: bool,
+    /// Quality character for FASTQ output (default 'I', phred 40).
+    pub qual_char: char,
+    /// Optional name template for headers.
+    pub name_template: Option<String>,
+    /// Optional VCF description to append to headers (per region, indexed by position).
+    pub vcf_descriptions: Vec<String>,
+}
 
 pub fn wrap_fasta(seq: &str, width: usize) -> String {
     if width == 0 {
@@ -35,6 +49,7 @@ fn strand_suffix(r: &Region) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn format_fasta_entry(r: &Region, seq: &str, line_width: usize) -> String {
     let suffix = strand_suffix(r);
     let header = match &r.name {
@@ -42,6 +57,43 @@ fn format_fasta_entry(r: &Region, seq: &str, line_width: usize) -> String {
         None => format!(">{}:{}-{}{suffix}", r.chr, r.start, r.end),
     };
     format!("{header}\n{}\n", wrap_fasta(seq, line_width))
+}
+
+/// Format a FASTA/FASTQ entry with optional template and description.
+fn format_entry_with_config(
+    r: &Region,
+    seq: &str,
+    line_width: usize,
+    index: usize,
+    config: &OutputConfig,
+) -> String {
+    let description = if index < config.vcf_descriptions.len() {
+        Some(config.vcf_descriptions[index].as_str())
+    } else {
+        None
+    };
+
+    let header_content = if let Some(template) = &config.name_template {
+        expand_template(template, r, index + 1) // 1-based index
+    } else {
+        let suffix = strand_suffix(r);
+        match &r.name {
+            Some(name) => format!("{name} {}:{}-{}{suffix}", r.chr, r.start, r.end),
+            None => format!("{}:{}-{}{suffix}", r.chr, r.start, r.end),
+        }
+    };
+
+    let full_header = match description {
+        Some(desc) => format!("{header_content} {desc}"),
+        None => header_content,
+    };
+
+    if config.fastq {
+        let qual: String = std::iter::repeat_n(config.qual_char, seq.len()).collect();
+        format!("@{full_header}\n{seq}\n+\n{qual}\n")
+    } else {
+        format!(">{full_header}\n{}\n", wrap_fasta(seq, line_width))
+    }
 }
 
 /// Format a region as a TSV line: chr, start, end, name, sequence.
@@ -70,6 +122,8 @@ fn extract_and_format(
     r: &Region,
     rc: bool,
     line_width: usize,
+    index: usize,
+    config: &OutputConfig,
 ) -> Result<(Region, String)> {
     thread_local! {
         static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
@@ -85,7 +139,7 @@ fn extract_and_format(
         let f = borrow.as_mut().unwrap();
         let seq = extract_region(f, fai_index, r)?;
         let seq = apply_strand_and_rc(seq, r, rc);
-        let entry = format_fasta_entry(r, &seq, line_width);
+        let entry = format_entry_with_config(r, &seq, line_width, index, config);
         Ok((r.clone(), entry))
     })
 }
@@ -101,14 +155,19 @@ pub fn write_sequences(
     rc: bool,
     line_width: usize,
     tab_out: bool,
+    config: &OutputConfig,
 ) -> Result<()> {
     match output_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             if is_sv {
-                write_sv_per_file_streaming(fasta_path, fai_index, regions, dir, rc, line_width)?;
+                write_sv_per_file_streaming(
+                    fasta_path, fai_index, regions, dir, rc, line_width, config,
+                )?;
             } else {
-                write_per_file_streaming(fasta_path, fai_index, regions, dir, rc, line_width)?;
+                write_per_file_streaming(
+                    fasta_path, fai_index, regions, dir, rc, line_width, config,
+                )?;
             }
         }
         None => {
@@ -122,6 +181,7 @@ pub fn write_sequences(
                     output_file,
                     rc,
                     line_width,
+                    config,
                 )?;
             }
         }
@@ -143,6 +203,7 @@ fn write_streaming_ordered(
     output_file: Option<&Path>,
     rc: bool,
     line_width: usize,
+    config: &OutputConfig,
 ) -> Result<()> {
     let groups = build_bulk_groups(regions, fai_index)?;
     let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
@@ -163,7 +224,7 @@ fn write_streaming_ordered(
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
                 let seq = apply_strand_and_rc(seq, r, rc);
-                let entry = format_fasta_entry(r, &seq, line_width);
+                let entry = format_entry_with_config(r, &seq, line_width, orig_idx, config);
                 let mut slot = slots[orig_idx].lock().unwrap();
                 *slot = Some(entry);
             }
@@ -239,17 +300,22 @@ fn write_per_file_streaming(
     dir: &Path,
     rc: bool,
     line_width: usize,
+    config: &OutputConfig,
 ) -> Result<()> {
-    regions.par_iter().try_for_each(|r| -> Result<()> {
-        let (region, entry) = extract_and_format(fasta_path, fai_index, r, rc, line_width)?;
-        let filename = match &region.name {
-            Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
-            None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
-        };
-        let mut f = File::create(dir.join(filename))?;
-        f.write_all(entry.as_bytes())?;
-        Ok(())
-    })
+    regions
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, r)| -> Result<()> {
+            let (region, entry) =
+                extract_and_format(fasta_path, fai_index, r, rc, line_width, i, config)?;
+            let filename = match &region.name {
+                Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
+                None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
+            };
+            let mut f = File::create(dir.join(filename))?;
+            f.write_all(entry.as_bytes())?;
+            Ok(())
+        })
 }
 
 fn write_sv_per_file_streaming(
@@ -259,6 +325,7 @@ fn write_sv_per_file_streaming(
     dir: &Path,
     rc: bool,
     line_width: usize,
+    config: &OutputConfig,
 ) -> Result<()> {
     if !regions.len().is_multiple_of(2) {
         return Err(anyhow!(
@@ -268,11 +335,18 @@ fn write_sv_per_file_streaming(
     }
     regions
         .chunks(2)
+        .enumerate()
         .collect::<Vec<_>>()
         .par_iter()
-        .try_for_each(|pair| -> Result<()> {
-            let (r1, entry1) = extract_and_format(fasta_path, fai_index, &pair[0], rc, line_width)?;
-            let (r2, entry2) = extract_and_format(fasta_path, fai_index, &pair[1], rc, line_width)?;
+        .try_for_each(|&(chunk_idx, pair)| -> Result<()> {
+            let idx1 = chunk_idx * 2;
+            let idx2 = chunk_idx * 2 + 1;
+            let (r1, entry1) = extract_and_format(
+                fasta_path, fai_index, &pair[0], rc, line_width, idx1, config,
+            )?;
+            let (r2, entry2) = extract_and_format(
+                fasta_path, fai_index, &pair[1], rc, line_width, idx2, config,
+            )?;
             let filename = match (&r1.name, &r2.name) {
                 (Some(n1), Some(n2)) if n1 == n2 => format!(
                     "{n1}_{}_{}_{}_{}_{}_{}.fa",
@@ -487,8 +561,17 @@ mod tests {
         })
         .collect();
         let out_file = tempfile::NamedTempFile::new().unwrap();
-        write_streaming_ordered(tmp.path(), &fai, &regions, Some(out_file.path()), false, 60)
-            .unwrap();
+        let config = OutputConfig::default();
+        write_streaming_ordered(
+            tmp.path(),
+            &fai,
+            &regions,
+            Some(out_file.path()),
+            false,
+            60,
+            &config,
+        )
+        .unwrap();
         let output = std::fs::read_to_string(out_file.path()).unwrap();
         let headers: Vec<&str> = output.lines().filter(|l| l.starts_with('>')).collect();
         let expected: Vec<String> = regions

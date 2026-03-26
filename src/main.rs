@@ -3,13 +3,16 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use multiseqex::fai::{build_fai, check_fai_staleness, fai_path_for, read_fai};
-use multiseqex::output::write_sequences;
+use multiseqex::gff::parse_regions_gff;
+use multiseqex::output::{OutputConfig, write_sequences};
 use multiseqex::region::{
     deduplicate_regions, merge_regions, parse_regions_bed, parse_regions_inline,
-    parse_regions_list, sort_regions,
+    parse_regions_list, resolve_flanks, sort_regions,
 };
+use multiseqex::stats::write_stats;
 use multiseqex::table::{parse_regions_sv_table, parse_regions_table};
 use multiseqex::validate::{detect_gzip_and_reject, validate_and_clamp_regions};
+use multiseqex::vcf::parse_regions_vcf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,8 +58,23 @@ struct Cli {
     /// Position mode: POS_LEFT, POS_RIGHT (requires --flank).
     /// Optional: NAME, STRAND.
     /// Extra columns are ignored.
-    #[arg(long, conflicts_with_all = ["regions", "table", "list", "contigs", "contig_list"])]
+    #[arg(long, conflicts_with_all = ["regions", "table", "list", "contigs", "contig_list", "vcf", "gff"])]
     sv_table: Option<PathBuf>,
+
+    /// VCF file. Each record produces a region spanning POS to POS+len(REF)-1.
+    /// The ID field is used as the region name (unless "."). REF and ALT are
+    /// included in the FASTA header description.
+    #[arg(long, conflicts_with = "sv_table")]
+    vcf: Option<PathBuf>,
+
+    /// GFF3/GTF annotation file. Extracts regions for features matching
+    /// --gff-feature (default: "gene").
+    #[arg(long, conflicts_with = "sv_table")]
+    gff: Option<PathBuf>,
+
+    /// Feature type to filter when using --gff (default: "gene").
+    #[arg(long, default_value = "gene", requires = "gff")]
+    gff_feature: String,
 
     /// Flank size for position-mode regions (POS columns in tables and
     /// pos+flank inline syntax). Has no effect on BED or range-format regions.
@@ -128,7 +146,7 @@ struct Cli {
     no_wrap: bool,
 
     /// Emit TSV output instead of FASTA (columns: chr, start, end, name, sequence).
-    #[arg(long, conflicts_with = "output_dir")]
+    #[arg(long, conflicts_with_all = ["output_dir", "fastq"])]
     tab_out: bool,
 
     /// Merge overlapping or book-ended regions on the same chromosome.
@@ -139,6 +157,26 @@ struct Cli {
     /// Maximum distance between regions to merge (default 0). Requires --merge.
     #[arg(long, default_value = "0")]
     merge_distance: u64,
+
+    /// Emit FASTQ output instead of FASTA. Uses a constant quality character
+    /// (default 'I', phred 40). See --qual.
+    #[arg(long, conflicts_with_all = ["tab_out"])]
+    fastq: bool,
+
+    /// Quality character for FASTQ output (default 'I', phred 40).
+    /// Must be a single ASCII character.
+    #[arg(long, default_value = "I", requires = "fastq")]
+    qual: String,
+
+    /// Print per-region statistics (TSV) instead of extracting sequences.
+    /// Columns: chr, start, end, name, length, gc_percent, n_count, masked_count.
+    #[arg(long, conflicts_with_all = ["output", "output_dir", "fastq", "tab_out", "reverse_complement"])]
+    stats: bool,
+
+    /// Template for FASTA/FASTQ header names. Placeholders: {chr}, {start},
+    /// {end}, {name}, {length}, {index}, {strand}.
+    #[arg(long, conflicts_with_all = ["tab_out", "stats"])]
+    name_template: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -194,6 +232,14 @@ fn main() -> Result<()> {
         ));
     }
 
+    // Validate --qual is a single ASCII character.
+    if cli.qual.len() != 1 || !cli.qual.is_ascii() {
+        return Err(anyhow!(
+            "--qual must be a single ASCII character, got '{}'",
+            cli.qual
+        ));
+    }
+
     detect_gzip_and_reject(&cli.fasta)?;
     let fai_path = fai_path_for(&cli.fasta);
     let mut fai_just_built = false;
@@ -216,6 +262,8 @@ fn main() -> Result<()> {
     }
     let fai_index = read_fai(&fai_path)?;
     let mut regions = Vec::new();
+    let mut vcf_descriptions: Vec<String> = Vec::new();
+
     if let Some(s) = cli.regions.as_deref() {
         regions.extend(parse_regions_inline(s, cli.flank)?);
     }
@@ -247,6 +295,38 @@ fn main() -> Result<()> {
             cli.flank_right,
             cli.delimiter.as_deref(),
         )?);
+    }
+
+    // --vcf: extract regions from VCF records.
+    if let Some(p) = cli.vcf.as_ref() {
+        let vcf_results = parse_regions_vcf(p, cli.flank, cli.flank_left, cli.flank_right)?;
+        let base_idx = regions.len();
+        for (region, rec) in vcf_results {
+            regions.push(region);
+            // Pad vcf_descriptions to align with region indices.
+            while vcf_descriptions.len() < base_idx {
+                vcf_descriptions.push(String::new());
+            }
+            vcf_descriptions.push(multiseqex::vcf::vcf_description(&rec));
+        }
+    }
+
+    // --gff: extract regions from GFF3/GTF annotation.
+    if let Some(p) = cli.gff.as_ref() {
+        let gff_regions = parse_regions_gff(p, &cli.gff_feature)?;
+        // Apply flanking to GFF regions if specified.
+        let has_flank =
+            cli.flank.is_some() || cli.flank_left.is_some() || cli.flank_right.is_some();
+        if has_flank {
+            let (fl, fr) = resolve_flanks(cli.flank, cli.flank_left, cli.flank_right);
+            for mut r in gff_regions {
+                r.start = r.start.saturating_sub(fl).max(1);
+                r.end = r.end.saturating_add(fr);
+                regions.push(r);
+            }
+        } else {
+            regions.extend(gff_regions);
+        }
     }
 
     // --contigs: extract whole contigs by name.
@@ -290,7 +370,8 @@ fn main() -> Result<()> {
 
     if regions.is_empty() {
         return Err(anyhow!(
-            "No regions provided. Use --regions, --list, --bed, --table, --sv-table, --contigs, or --contig-list."
+            "No regions provided. Use --regions, --list, --bed, --table, --sv-table, \
+             --vcf, --gff, --contigs, or --contig-list."
         ));
     }
     if cli.deduplicate {
@@ -317,7 +398,20 @@ fn main() -> Result<()> {
 
     validate_and_clamp_regions(&mut regions, &fai_index)?;
 
+    // --stats: print statistics table and exit.
+    if cli.stats {
+        write_stats(&cli.fasta, &fai_index, &regions)?;
+        return Ok(());
+    }
+
     let effective_line_width = if cli.no_wrap { 0 } else { cli.line_width };
+
+    let config = OutputConfig {
+        fastq: cli.fastq,
+        qual_char: cli.qual.chars().next().unwrap_or('I'),
+        name_template: cli.name_template,
+        vcf_descriptions,
+    };
 
     let is_sv = cli.sv_table.is_some();
     let output_to_file = cli.output.is_some() || cli.output_dir.is_some();
@@ -334,6 +428,7 @@ fn main() -> Result<()> {
         cli.reverse_complement,
         effective_line_width,
         cli.tab_out,
+        &config,
     )?;
     if !cli.quiet && output_to_file {
         eprintln!("Done.");
