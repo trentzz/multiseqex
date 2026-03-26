@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use multiseqex::fai::{build_fai, check_fai_staleness, fai_path_for, read_fai};
 use multiseqex::gff::parse_regions_gff;
+use multiseqex::mask::MaskIndex;
 use multiseqex::output::{OutputConfig, write_sequences};
 use multiseqex::region::{
     deduplicate_regions, merge_regions, parse_regions_bed, parse_regions_inline,
@@ -11,6 +12,7 @@ use multiseqex::region::{
 };
 use multiseqex::stats::write_stats;
 use multiseqex::table::{parse_regions_sv_table, parse_regions_table};
+use multiseqex::transform::TransformConfig;
 use multiseqex::validate::{detect_gzip_and_reject, validate_and_clamp_regions};
 use multiseqex::vcf::parse_regions_vcf;
 
@@ -22,8 +24,11 @@ use multiseqex::vcf::parse_regions_vcf;
     about = "Multi-sequence extractor for FASTA using FAI"
 )]
 struct Cli {
-    /// Reference FASTA file (plain text, not compressed).
-    fasta: PathBuf,
+    /// Reference FASTA file(s) (plain text, not compressed).
+    /// When multiple files are given, contigs are looked up across all files.
+    /// A contig must appear in exactly one file.
+    #[arg(required = true)]
+    fasta: Vec<PathBuf>,
 
     /// Comma-separated regions: chr:start-end, chr2:start-end, ...
     #[arg(long)]
@@ -129,7 +134,7 @@ struct Cli {
     #[arg(long)]
     sort: bool,
 
-    /// Suppress progress messages and warnings on stderr.
+    /// Suppress progress messages, warnings, and the progress bar on stderr.
     #[arg(short, long)]
     quiet: bool,
 
@@ -177,6 +182,37 @@ struct Cli {
     /// {end}, {name}, {length}, {index}, {strand}.
     #[arg(long, conflicts_with_all = ["tab_out", "stats"])]
     name_template: Option<String>,
+
+    // ── Masking flags ──────────────────────────────────────────────────
+    /// BED file defining regions to mask within extracted sequences.
+    #[arg(long)]
+    mask_bed: Option<PathBuf>,
+
+    /// Replace masked bases with N (default when --mask-bed is given).
+    #[arg(long, requires = "mask_bed", conflicts_with = "soft_mask")]
+    hard_mask: bool,
+
+    /// Lowercase masked bases instead of replacing with N.
+    #[arg(long, requires = "mask_bed", conflicts_with = "hard_mask")]
+    soft_mask: bool,
+
+    // ── Transform flags ────────────────────────────────────────────────
+    /// Convert T to U in output sequences (DNA to RNA).
+    #[arg(long, conflicts_with = "translate")]
+    to_rna: bool,
+
+    /// Translate to amino acids (standard genetic code, reading frame from
+    /// position 1). Stop codons are represented as *.
+    #[arg(long, conflicts_with = "to_rna")]
+    translate: bool,
+
+    /// Force all output bases to uppercase.
+    #[arg(long, conflicts_with = "lowercase")]
+    uppercase: bool,
+
+    /// Force all output bases to lowercase.
+    #[arg(long, conflicts_with = "uppercase")]
+    lowercase: bool,
 }
 
 fn main() -> Result<()> {
@@ -240,27 +276,89 @@ fn main() -> Result<()> {
         ));
     }
 
-    detect_gzip_and_reject(&cli.fasta)?;
-    let fai_path = fai_path_for(&cli.fasta);
-    let mut fai_just_built = false;
-    if !fai_path.exists() {
-        if cli.no_build_fai {
-            return Err(anyhow!(
-                "Missing index: {} (use samtools faidx or remove --no-build-fai)",
-                fai_path.display()
-            ));
-        }
-        if !cli.quiet {
-            eprintln!("Index not found. Building FAI: {}", fai_path.display());
-        }
-        build_fai(&cli.fasta, &fai_path)?;
-        fai_just_built = true;
+    // --to-rna and --translate conflict with --stats.
+    if (cli.to_rna || cli.translate) && cli.stats {
+        return Err(anyhow!(
+            "--to-rna and --translate cannot be used with --stats"
+        ));
     }
 
-    if !fai_just_built && !cli.quiet {
-        check_fai_staleness(&cli.fasta, &fai_path);
+    // Build mask index if --mask-bed is given.
+    let mask_index = if let Some(ref mask_path) = cli.mask_bed {
+        Some(MaskIndex::from_bed(mask_path)?)
+    } else {
+        None
+    };
+
+    let mask_mode = if cli.soft_mask {
+        multiseqex::mask::MaskMode::Soft
+    } else {
+        // Default to hard mask when --mask-bed is given.
+        multiseqex::mask::MaskMode::Hard
+    };
+
+    // Build transform config.
+    let transform = TransformConfig {
+        to_rna: cli.to_rna,
+        uppercase: cli.uppercase,
+        lowercase: cli.lowercase,
+        translate: cli.translate,
+    };
+
+    // ── Load FASTA files and build combined index ──────────────────────
+
+    // Validate all FASTA files and build/load their FAI indices.
+    let mut fasta_paths: Vec<PathBuf> = Vec::with_capacity(cli.fasta.len());
+    let mut fai_indices = Vec::new();
+
+    for fasta_path in &cli.fasta {
+        detect_gzip_and_reject(fasta_path)?;
+        let fai_path = fai_path_for(fasta_path);
+        let mut fai_just_built = false;
+        if !fai_path.exists() {
+            if cli.no_build_fai {
+                return Err(anyhow!(
+                    "Missing index: {} (use samtools faidx or remove --no-build-fai)",
+                    fai_path.display()
+                ));
+            }
+            if !cli.quiet {
+                eprintln!("Index not found. Building FAI: {}", fai_path.display());
+            }
+            build_fai(fasta_path, &fai_path)?;
+            fai_just_built = true;
+        }
+
+        if !fai_just_built && !cli.quiet {
+            check_fai_staleness(fasta_path, &fai_path);
+        }
+        let idx = read_fai(&fai_path)?;
+        fasta_paths.push(fasta_path.clone());
+        fai_indices.push(idx);
     }
-    let fai_index = read_fai(&fai_path)?;
+
+    // Build the combined FAI index. Maps contig name to (fasta_file_index, FaiRecord).
+    // Error if a contig appears in multiple FASTA files.
+    let mut combined_fai = std::collections::HashMap::new();
+    let mut contig_to_fasta: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (file_idx, idx) in fai_indices.iter().enumerate() {
+        for (name, rec) in idx {
+            if let Some(prev_idx) = contig_to_fasta.get(name) {
+                return Err(anyhow!(
+                    "Contig '{}' appears in multiple FASTA files: '{}' and '{}'",
+                    name,
+                    fasta_paths[*prev_idx].display(),
+                    fasta_paths[file_idx].display()
+                ));
+            }
+            contig_to_fasta.insert(name.clone(), file_idx);
+            combined_fai.insert(name.clone(), rec.clone());
+        }
+    }
+
+    let fai_index = combined_fai;
+
     let mut regions = Vec::new();
     let mut vcf_descriptions: Vec<String> = Vec::new();
 
@@ -400,7 +498,7 @@ fn main() -> Result<()> {
 
     // --stats: print statistics table and exit.
     if cli.stats {
-        write_stats(&cli.fasta, &fai_index, &regions)?;
+        write_stats(&fasta_paths, &fai_index, &contig_to_fasta, &regions)?;
         return Ok(());
     }
 
@@ -411,16 +509,23 @@ fn main() -> Result<()> {
         qual_char: cli.qual.chars().next().unwrap_or('I'),
         name_template: cli.name_template,
         vcf_descriptions,
+        mask_index,
+        mask_mode,
+        transform,
     };
 
     let is_sv = cli.sv_table.is_some();
     let output_to_file = cli.output.is_some() || cli.output_dir.is_some();
-    if !cli.quiet && output_to_file {
+
+    // Show progress bar on stderr when writing to a file and not quiet.
+    let show_progress = !cli.quiet && output_to_file;
+    if show_progress {
         eprintln!("Extracting {} regions from FASTA...", regions.len());
     }
     write_sequences(
-        &cli.fasta,
+        &fasta_paths,
         &fai_index,
+        &contig_to_fasta,
         &regions,
         cli.output.as_deref(),
         cli.output_dir.as_deref(),
@@ -429,8 +534,9 @@ fn main() -> Result<()> {
         effective_line_width,
         cli.tab_out,
         &config,
+        show_progress,
     )?;
-    if !cli.quiet && output_to_file {
+    if show_progress {
         eprintln!("Done.");
     }
     Ok(())

@@ -1,16 +1,19 @@
 use anyhow::{Context, Result, anyhow};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::extract::{build_bulk_groups, extract_bulk_group, extract_region, reverse_complement};
 use crate::fai::FaiRecord;
+use crate::mask::{MaskIndex, MaskMode};
 use crate::region::Region;
 use crate::template::expand_template;
+use crate::transform::TransformConfig;
 
 /// Output format configuration.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +26,12 @@ pub struct OutputConfig {
     pub name_template: Option<String>,
     /// Optional VCF description to append to headers (per region, indexed by position).
     pub vcf_descriptions: Vec<String>,
+    /// Optional mask index for masking extracted sequences.
+    pub mask_index: Option<MaskIndex>,
+    /// Masking mode (hard or soft). Only used when mask_index is Some.
+    pub mask_mode: MaskMode,
+    /// Sequence transform configuration.
+    pub transform: TransformConfig,
 }
 
 pub fn wrap_fasta(seq: &str, width: usize) -> String {
@@ -116,8 +125,55 @@ fn apply_strand_and_rc(seq: String, r: &Region, rc: bool) -> String {
     }
 }
 
+/// Apply masking and transforms to an extracted sequence.
+fn apply_post_processing(seq: String, r: &Region, config: &OutputConfig) -> String {
+    let mut s = seq;
+
+    // Apply masking.
+    if let Some(ref mask_idx) = config.mask_index {
+        s = mask_idx.apply(&s, &r.chr, r.start, r.end, config.mask_mode);
+    }
+
+    // Apply transforms.
+    if config.transform.any_active() {
+        s = config.transform.apply(&s);
+    }
+
+    s
+}
+
+/// Resolve the correct FASTA path for a given region.
+fn fasta_for_region<'a>(
+    fasta_paths: &'a [PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
+    chr: &str,
+) -> &'a Path {
+    if fasta_paths.len() == 1 {
+        return &fasta_paths[0];
+    }
+    let idx = contig_to_fasta.get(chr).copied().unwrap_or(0);
+    &fasta_paths[idx]
+}
+
+/// Create a progress bar for extraction.
+fn make_progress_bar(total: u64, show: bool) -> ProgressBar {
+    if !show {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40}] {pos}/{len} regions ({eta})")
+            .expect("invalid progress bar template")
+            .progress_chars("=>-"),
+    );
+    pb
+}
+
+#[allow(clippy::too_many_arguments)]
 fn extract_and_format(
-    fasta_path: &Path,
+    fasta_paths: &[PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
     fai_index: &HashMap<String, FaiRecord>,
     r: &Region,
     rc: bool,
@@ -125,20 +181,22 @@ fn extract_and_format(
     index: usize,
     config: &OutputConfig,
 ) -> Result<(Region, String)> {
+    let fasta_path = fasta_for_region(fasta_paths, contig_to_fasta, &r.chr);
     thread_local! {
-        static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+        // Cache one file handle per FASTA path per thread.
+        static TL_FILES: RefCell<HashMap<PathBuf, File>> = RefCell::new(HashMap::new());
     }
-    TL_FILE.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        if borrow.is_none() {
-            *borrow = Some(
-                File::open(fasta_path)
-                    .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?,
-            );
+    TL_FILES.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(fasta_path) {
+            let f = File::open(fasta_path)
+                .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?;
+            map.insert(fasta_path.to_path_buf(), f);
         }
-        let f = borrow.as_mut().unwrap();
+        let f = map.get_mut(fasta_path).unwrap();
         let seq = extract_region(f, fai_index, r)?;
         let seq = apply_strand_and_rc(seq, r, rc);
+        let seq = apply_post_processing(seq, r, config);
         let entry = format_entry_with_config(r, &seq, line_width, index, config);
         Ok((r.clone(), entry))
     })
@@ -146,8 +204,9 @@ fn extract_and_format(
 
 #[allow(clippy::too_many_arguments)]
 pub fn write_sequences(
-    fasta_path: &Path,
+    fasta_paths: &[PathBuf],
     fai_index: &HashMap<String, FaiRecord>,
+    contig_to_fasta: &HashMap<String, usize>,
     regions: &[Region],
     output_file: Option<&Path>,
     output_dir: Option<&Path>,
@@ -156,32 +215,60 @@ pub fn write_sequences(
     line_width: usize,
     tab_out: bool,
     config: &OutputConfig,
+    show_progress: bool,
 ) -> Result<()> {
     match output_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             if is_sv {
                 write_sv_per_file_streaming(
-                    fasta_path, fai_index, regions, dir, rc, line_width, config,
+                    fasta_paths,
+                    contig_to_fasta,
+                    fai_index,
+                    regions,
+                    dir,
+                    rc,
+                    line_width,
+                    config,
+                    show_progress,
                 )?;
             } else {
                 write_per_file_streaming(
-                    fasta_path, fai_index, regions, dir, rc, line_width, config,
+                    fasta_paths,
+                    contig_to_fasta,
+                    fai_index,
+                    regions,
+                    dir,
+                    rc,
+                    line_width,
+                    config,
+                    show_progress,
                 )?;
             }
         }
         None => {
             if tab_out {
-                write_tab_output(fasta_path, fai_index, regions, output_file, rc)?;
+                write_tab_output(
+                    fasta_paths,
+                    contig_to_fasta,
+                    fai_index,
+                    regions,
+                    output_file,
+                    rc,
+                    config,
+                    show_progress,
+                )?;
             } else {
                 write_streaming_ordered(
-                    fasta_path,
+                    fasta_paths,
+                    contig_to_fasta,
                     fai_index,
                     regions,
                     output_file,
                     rc,
                     line_width,
                     config,
+                    show_progress,
                 )?;
             }
         }
@@ -196,7 +283,75 @@ pub fn write_sequences(
 /// memory usage scales with total output size rather than with the number
 /// of regions alone. For very large extraction jobs where memory is a
 /// concern, prefer `--output-dir` which streams each region independently.
+#[allow(clippy::too_many_arguments)]
 fn write_streaming_ordered(
+    fasta_paths: &[PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
+    fai_index: &HashMap<String, FaiRecord>,
+    regions: &[Region],
+    output_file: Option<&Path>,
+    rc: bool,
+    line_width: usize,
+    config: &OutputConfig,
+    show_progress: bool,
+) -> Result<()> {
+    // When using a single FASTA file, use the optimised bulk-read path.
+    // For multiple FASTA files, fall back to per-region extraction.
+    if fasta_paths.len() == 1 {
+        return write_streaming_ordered_single(
+            &fasta_paths[0],
+            fai_index,
+            regions,
+            output_file,
+            rc,
+            line_width,
+            config,
+            show_progress,
+        );
+    }
+
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
+    let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
+
+    regions
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, r)| -> Result<()> {
+            let (_, entry) = extract_and_format(
+                fasta_paths,
+                contig_to_fasta,
+                fai_index,
+                r,
+                rc,
+                line_width,
+                i,
+                config,
+            )?;
+            let mut slot = slots[i].lock().unwrap();
+            *slot = Some(entry);
+            pb.inc(1);
+            Ok(())
+        })?;
+
+    pb.finish_and_clear();
+
+    let mut writer: Box<dyn Write> = match output_file {
+        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    for slot in &slots {
+        let guard = slot.lock().unwrap();
+        if let Some(entry) = guard.as_ref() {
+            writer.write_all(entry.as_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Optimised path for a single FASTA file using bulk reads.
+#[allow(clippy::too_many_arguments)]
+fn write_streaming_ordered_single(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
@@ -204,8 +359,10 @@ fn write_streaming_ordered(
     rc: bool,
     line_width: usize,
     config: &OutputConfig,
+    show_progress: bool,
 ) -> Result<()> {
     let groups = build_bulk_groups(regions, fai_index)?;
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
     let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
     groups.par_iter().try_for_each(|group| -> Result<()> {
         thread_local! {
@@ -224,13 +381,16 @@ fn write_streaming_ordered(
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
                 let seq = apply_strand_and_rc(seq, r, rc);
+                let seq = apply_post_processing(seq, r, config);
                 let entry = format_entry_with_config(r, &seq, line_width, orig_idx, config);
                 let mut slot = slots[orig_idx].lock().unwrap();
                 *slot = Some(entry);
+                pb.inc(1);
             }
             Ok(())
         })
     })?;
+    pb.finish_and_clear();
     let mut writer: Box<dyn Write> = match output_file {
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
@@ -246,14 +406,88 @@ fn write_streaming_ordered(
 }
 
 /// Write TSV output: chr, start, end, name, sequence.
+#[allow(clippy::too_many_arguments)]
 fn write_tab_output(
+    fasta_paths: &[PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
+    fai_index: &HashMap<String, FaiRecord>,
+    regions: &[Region],
+    output_file: Option<&Path>,
+    rc: bool,
+    config: &OutputConfig,
+    show_progress: bool,
+) -> Result<()> {
+    if fasta_paths.len() == 1 {
+        return write_tab_output_single(
+            &fasta_paths[0],
+            fai_index,
+            regions,
+            output_file,
+            rc,
+            config,
+            show_progress,
+        );
+    }
+
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
+    let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
+
+    regions
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, r)| -> Result<()> {
+            let fasta_path = fasta_for_region(fasta_paths, contig_to_fasta, &r.chr);
+            thread_local! {
+                static TL_FILES: RefCell<HashMap<PathBuf, File>> = RefCell::new(HashMap::new());
+            }
+            TL_FILES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                if !map.contains_key(fasta_path) {
+                    let f = File::open(fasta_path)
+                        .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?;
+                    map.insert(fasta_path.to_path_buf(), f);
+                }
+                let f = map.get_mut(fasta_path).unwrap();
+                let seq = extract_region(f, fai_index, r)?;
+                let seq = apply_strand_and_rc(seq, r, rc);
+                let seq = apply_post_processing(seq, r, config);
+                let entry = format_tab_entry(r, &seq);
+                let mut slot = slots[i].lock().unwrap();
+                *slot = Some(entry);
+                pb.inc(1);
+                Ok(())
+            })
+        })?;
+
+    pb.finish_and_clear();
+
+    let mut writer: Box<dyn Write> = match output_file {
+        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    for slot in &slots {
+        let guard = slot.lock().unwrap();
+        if let Some(entry) = guard.as_ref() {
+            writer.write_all(entry.as_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Optimised tab output path for a single FASTA file.
+#[allow(clippy::too_many_arguments)]
+fn write_tab_output_single(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
     output_file: Option<&Path>,
     rc: bool,
+    config: &OutputConfig,
+    show_progress: bool,
 ) -> Result<()> {
     let groups = build_bulk_groups(regions, fai_index)?;
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
     let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
     groups.par_iter().try_for_each(|group| -> Result<()> {
         thread_local! {
@@ -272,13 +506,16 @@ fn write_tab_output(
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
                 let seq = apply_strand_and_rc(seq, r, rc);
+                let seq = apply_post_processing(seq, r, config);
                 let entry = format_tab_entry(r, &seq);
                 let mut slot = slots[orig_idx].lock().unwrap();
                 *slot = Some(entry);
+                pb.inc(1);
             }
             Ok(())
         })
     })?;
+    pb.finish_and_clear();
     let mut writer: Box<dyn Write> = match output_file {
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
         None => Box::new(BufWriter::new(io::stdout())),
@@ -293,39 +530,57 @@ fn write_tab_output(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_per_file_streaming(
-    fasta_path: &Path,
+    fasta_paths: &[PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
     dir: &Path,
     rc: bool,
     line_width: usize,
     config: &OutputConfig,
+    show_progress: bool,
 ) -> Result<()> {
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
     regions
         .par_iter()
         .enumerate()
         .try_for_each(|(i, r)| -> Result<()> {
-            let (region, entry) =
-                extract_and_format(fasta_path, fai_index, r, rc, line_width, i, config)?;
+            let (region, entry) = extract_and_format(
+                fasta_paths,
+                contig_to_fasta,
+                fai_index,
+                r,
+                rc,
+                line_width,
+                i,
+                config,
+            )?;
             let filename = match &region.name {
                 Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
                 None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
             };
             let mut f = File::create(dir.join(filename))?;
             f.write_all(entry.as_bytes())?;
+            pb.inc(1);
             Ok(())
-        })
+        })?;
+    pb.finish_and_clear();
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_sv_per_file_streaming(
-    fasta_path: &Path,
+    fasta_paths: &[PathBuf],
+    contig_to_fasta: &HashMap<String, usize>,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
     dir: &Path,
     rc: bool,
     line_width: usize,
     config: &OutputConfig,
+    show_progress: bool,
 ) -> Result<()> {
     if !regions.len().is_multiple_of(2) {
         return Err(anyhow!(
@@ -333,6 +588,7 @@ fn write_sv_per_file_streaming(
             regions.len()
         ));
     }
+    let pb = make_progress_bar(regions.len() as u64, show_progress);
     regions
         .chunks(2)
         .enumerate()
@@ -342,10 +598,24 @@ fn write_sv_per_file_streaming(
             let idx1 = chunk_idx * 2;
             let idx2 = chunk_idx * 2 + 1;
             let (r1, entry1) = extract_and_format(
-                fasta_path, fai_index, &pair[0], rc, line_width, idx1, config,
+                fasta_paths,
+                contig_to_fasta,
+                fai_index,
+                &pair[0],
+                rc,
+                line_width,
+                idx1,
+                config,
             )?;
             let (r2, entry2) = extract_and_format(
-                fasta_path, fai_index, &pair[1], rc, line_width, idx2, config,
+                fasta_paths,
+                contig_to_fasta,
+                fai_index,
+                &pair[1],
+                rc,
+                line_width,
+                idx2,
+                config,
             )?;
             let filename = match (&r1.name, &r2.name) {
                 (Some(n1), Some(n2)) if n1 == n2 => format!(
@@ -363,8 +633,11 @@ fn write_sv_per_file_streaming(
             let mut f = File::create(dir.join(filename))?;
             f.write_all(entry1.as_bytes())?;
             f.write_all(entry2.as_bytes())?;
+            pb.inc(2);
             Ok(())
-        })
+        })?;
+    pb.finish_and_clear();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -562,7 +835,7 @@ mod tests {
         .collect();
         let out_file = tempfile::NamedTempFile::new().unwrap();
         let config = OutputConfig::default();
-        write_streaming_ordered(
+        write_streaming_ordered_single(
             tmp.path(),
             &fai,
             &regions,
@@ -570,6 +843,7 @@ mod tests {
             false,
             60,
             &config,
+            false,
         )
         .unwrap();
         let output = std::fs::read_to_string(out_file.path()).unwrap();

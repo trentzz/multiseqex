@@ -1912,3 +1912,250 @@ fn name_template_conflicts_with_stats() {
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
 }
+
+// ─── Feature 9: Sequence masking ────────────────────────────────────────────
+
+#[test]
+fn mask_bed_hard_mask() {
+    // mask.bed has BED intervals: chr1:2-5 (0-based) = 1-based [3,5]
+    // and chr1:7-9 (0-based) = 1-based [8,9].
+    // chr1:1-10 = AAACCCGGGT
+    // Mask [3,5]: pos 3,4,5 (A,C,C) -> NNN
+    // Mask [8,9]: pos 8,9 (G,G) -> NN
+    // Result: AA + NNN + CG + NN + T = AANNNCGNNT
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args(["--mask-bed", &fixture("mask.bed")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AANNNCGNNT"));
+}
+
+#[test]
+fn mask_bed_soft_mask() {
+    // Same positions, but lowercase instead of N.
+    // pos 3-5: A,C,C -> a,c,c. pos 8-9: G,G -> g,g
+    // "AA" + "acc" + "CG" + "gg" + "T" = "AAaccCGggT"
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args(["--mask-bed", &fixture("mask.bed"), "--soft-mask"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAaccCGggT"));
+}
+
+#[test]
+fn mask_bed_requires_mask_bed_flag() {
+    // --hard-mask without --mask-bed should fail.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--hard-mask"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn soft_mask_conflicts_with_hard_mask() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--mask-bed",
+            &fixture("mask.bed"),
+            "--soft-mask",
+            "--hard-mask",
+        ])
+        .assert()
+        .failure();
+}
+
+// ─── Feature 13: Multiple FASTA support ─────────────────────────────────────
+
+#[test]
+fn multiple_fasta_files() {
+    // test.fa has chr1,chr2,chr3. extra.fa has chrX,chrY.
+    cmd()
+        .arg(fixture("test.fa"))
+        .arg(fixture("extra.fa"))
+        .args(["--regions", "chr1:1-10,chrX:1-10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        .stdout(predicate::str::contains("GGGGGGGGGG"));
+}
+
+#[test]
+fn multiple_fasta_extract_from_second_file_only() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .arg(fixture("extra.fa"))
+        .args(["--regions", "chrX:1-20"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GGGGGGGGGGAAAAAAAAAA"));
+}
+
+#[test]
+fn multiple_fasta_duplicate_contig_errors() {
+    // Passing the same file twice should error because contigs appear in both.
+    cmd()
+        .arg(fixture("test.fa"))
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multiple FASTA files"));
+}
+
+// ─── Feature 14: Progress bar ───────────────────────────────────────────────
+
+#[test]
+fn progress_bar_shows_region_count() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out.fa");
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:1-10,chr3:1-10"])
+        .args(["--output", out.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("3 regions"));
+}
+
+#[test]
+fn progress_bar_hidden_when_quiet() {
+    let tmp = TempDir::new().unwrap();
+    let out = tmp.path().join("out.fa");
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:1-10"])
+        .args(["--output", out.to_str().unwrap()])
+        .arg("--quiet")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+// ─── Feature 19: Sequence transforms ────────────────────────────────────────
+
+#[test]
+fn transform_to_rna() {
+    // chr1:1-10 = AAACCCGGGT -> AAACCCGGGU (T -> U)
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--to-rna"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAACCCGGGU"));
+}
+
+#[test]
+fn transform_uppercase() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--uppercase"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAACCCGGGT"));
+}
+
+#[test]
+fn transform_lowercase() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--lowercase"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaacccgggt"));
+}
+
+#[test]
+fn transform_translate() {
+    // chr1:1-12 = AAACCCGGGTTT
+    // Codons: AAA=K, CCC=P, GGG=G, TTT=F
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-12", "--translate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("KPGF"));
+}
+
+#[test]
+fn transform_to_rna_conflicts_with_translate() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--to-rna", "--translate"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn transform_uppercase_conflicts_with_lowercase() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--uppercase", "--lowercase"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn transform_to_rna_conflicts_with_stats() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--to-rna", "--stats"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with --stats"));
+}
+
+#[test]
+fn transform_translate_conflicts_with_stats() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--translate", "--stats"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with --stats"));
+}
+
+#[test]
+fn transform_soft_mask_then_lowercase() {
+    // Combine masking with transform: soft mask + lowercase forces everything lowercase.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args([
+            "--mask-bed",
+            &fixture("mask.bed"),
+            "--soft-mask",
+            "--lowercase",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("aaacccgggt"));
+}
+
+#[test]
+fn transform_to_rna_with_soft_mask() {
+    // Soft mask positions 3-5 and 8-9, then convert T->U/t->u.
+    // After soft mask: AAaccCGggT
+    // After to_rna: AAaccCGggU
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10"])
+        .args([
+            "--mask-bed",
+            &fixture("mask.bed"),
+            "--soft-mask",
+            "--to-rna",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAaccCGggU"));
+}

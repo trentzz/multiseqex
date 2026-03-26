@@ -104,40 +104,71 @@ fn extract_raw_sequence(
 }
 
 /// Write statistics for all regions as a TSV table.
+///
+/// Supports multiple FASTA files via `contig_to_fasta` mapping.
 pub fn write_stats(
-    fasta_path: &std::path::Path,
+    fasta_paths: &[std::path::PathBuf],
     fai_index: &HashMap<String, FaiRecord>,
+    contig_to_fasta: &HashMap<String, usize>,
     regions: &[Region],
 ) -> Result<()> {
     // We need raw (case-preserving) extraction for masked-base counting.
-    // Use parallel extraction via bulk groups, but with raw sequences.
-    let groups = build_bulk_groups(regions, fai_index)?;
+    // Use parallel extraction via bulk groups for single FASTA, or
+    // per-region extraction for multiple FASTA files.
     let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
 
-    groups.par_iter().try_for_each(|group| -> Result<()> {
-        thread_local! {
-            static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
-        }
-        TL_FILE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            if borrow.is_none() {
-                *borrow = Some(
-                    File::open(fasta_path)
-                        .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?,
-                );
+    if fasta_paths.len() == 1 {
+        let fasta_path = &fasta_paths[0];
+        let groups = build_bulk_groups(regions, fai_index)?;
+        groups.par_iter().try_for_each(|group| -> Result<()> {
+            thread_local! {
+                static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
             }
-            let f = borrow.as_mut().unwrap();
-            // Extract raw sequences for this group.
-            // We reuse bulk group structure but do raw extraction per region.
-            for &orig_idx in &group.indices {
-                let r = &regions[orig_idx];
-                let seq = extract_raw_sequence(f, fai_index, r)?;
-                let mut slot = slots[orig_idx].lock().unwrap();
-                *slot = Some(seq);
-            }
-            Ok(())
-        })
-    })?;
+            TL_FILE.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if borrow.is_none() {
+                    *borrow =
+                        Some(File::open(fasta_path).with_context(|| {
+                            format!("Cannot open FASTA: {}", fasta_path.display())
+                        })?);
+                }
+                let f = borrow.as_mut().unwrap();
+                for &orig_idx in &group.indices {
+                    let r = &regions[orig_idx];
+                    let seq = extract_raw_sequence(f, fai_index, r)?;
+                    let mut slot = slots[orig_idx].lock().unwrap();
+                    *slot = Some(seq);
+                }
+                Ok(())
+            })
+        })?;
+    } else {
+        regions
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(i, r)| -> Result<()> {
+                let file_idx = contig_to_fasta.get(&r.chr).copied().unwrap_or(0);
+                let fasta_path = &fasta_paths[file_idx];
+                thread_local! {
+                    static TL_FILES: RefCell<HashMap<std::path::PathBuf, File>> =
+                        RefCell::new(HashMap::new());
+                }
+                TL_FILES.with(|cell| {
+                    let mut map = cell.borrow_mut();
+                    if !map.contains_key(fasta_path.as_path()) {
+                        let f = File::open(fasta_path).with_context(|| {
+                            format!("Cannot open FASTA: {}", fasta_path.display())
+                        })?;
+                        map.insert(fasta_path.clone(), f);
+                    }
+                    let f = map.get_mut(fasta_path.as_path()).unwrap();
+                    let seq = extract_raw_sequence(f, fai_index, r)?;
+                    let mut slot = slots[i].lock().unwrap();
+                    *slot = Some(seq);
+                    Ok(())
+                })
+            })?;
+    }
 
     let mut writer = BufWriter::new(io::stdout());
     // Header row.

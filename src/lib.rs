@@ -2,11 +2,13 @@
 pub mod extract;
 pub mod fai;
 pub mod gff;
+pub mod mask;
 pub mod output;
 pub mod region;
 pub mod stats;
 pub mod table;
 pub mod template;
+pub mod transform;
 pub mod validate;
 pub mod vcf;
 
@@ -14,6 +16,7 @@ pub mod vcf;
 pub use extract::{extract_region, reverse_complement};
 pub use fai::{FaiRecord, build_fai, read_fai};
 pub use gff::parse_regions_gff;
+pub use mask::{MaskIndex, MaskMode};
 pub use output::wrap_fasta;
 pub use region::{
     Region, deduplicate_regions, merge_regions, parse_region_str, parse_regions_bed,
@@ -21,4 +24,5 @@ pub use region::{
 };
 pub use stats::{RegionStats, compute_stats};
 pub use template::expand_template;
+pub use transform::TransformConfig;
 pub use vcf::{VcfRecord, parse_regions_vcf};
