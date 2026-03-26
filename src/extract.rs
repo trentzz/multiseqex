@@ -1,15 +1,19 @@
 use anyhow::{Result, anyhow};
-use std::cmp::min;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::fai::FaiRecord;
 use crate::region::Region;
+#[cfg(test)]
+use crate::region::Strand;
 
 /// Extract a region from a FASTA file using the FAI index.
-/// Accepts a mutable file handle to allow reuse across calls on the same thread.
-pub(crate) fn extract_region(
+///
+/// Uses a single seek and one bulk read for the entire region, then strips
+/// newline characters in memory. This minimises syscalls compared to reading
+/// line by line.
+pub fn extract_region(
     f: &mut File,
     fai: &HashMap<String, FaiRecord>,
     r: &Region,
@@ -36,27 +40,31 @@ pub(crate) fn extract_region(
     let lb = rec.line_bases;
     let lby = rec.line_bytes;
 
-    let mut seq = Vec::<u8>::with_capacity((r.end - r.start + 1) as usize);
-    let mut pos = r.start;
+    // Compute byte range: start offset and end offset (inclusive).
+    let start_line = (r.start - 1) / lb;
+    let start_col = (r.start - 1) % lb;
+    let byte_start = rec.offset + start_line * lby + start_col;
 
-    while pos <= r.end {
-        let line_idx = (pos - 1) / lb;
-        let in_line_offset = (pos - 1) % lb;
-        let run = min(lb - in_line_offset, r.end - pos + 1);
-        let byte_pos = rec.offset + line_idx * lby + in_line_offset;
+    let end_line = (r.end - 1) / lb;
+    let end_col = (r.end - 1) % lb;
+    let byte_end = rec.offset + end_line * lby + end_col;
 
-        f.seek(SeekFrom::Start(byte_pos))?;
-        let mut buf = vec![0u8; run as usize];
-        f.read_exact(&mut buf)?;
-        seq.extend_from_slice(&buf);
+    let read_len = (byte_end - byte_start + 1) as usize;
 
-        pos += run;
+    // Single seek, single read.
+    f.seek(SeekFrom::Start(byte_start))?;
+    let mut buf = vec![0u8; read_len];
+    f.read_exact(&mut buf)?;
+
+    // Strip newline characters in memory and normalise to uppercase.
+    let expected_bases = (r.end - r.start + 1) as usize;
+    let mut seq = Vec::<u8>::with_capacity(expected_bases);
+    for &b in &buf {
+        if b != b'\n' && b != b'\r' {
+            seq.push(b.to_ascii_uppercase());
+        }
     }
 
-    // Normalise to uppercase.
-    for b in &mut seq {
-        b.make_ascii_uppercase();
-    }
     Ok(String::from_utf8(seq)?)
 }
 
@@ -90,6 +98,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 0,
             end: 5,
+            strand: Strand::Unspecified,
         };
 
         let mut f = File::open(tmp.path()).unwrap();

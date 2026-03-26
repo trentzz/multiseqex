@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use crate::region::Region;
 
 /// Wrap a sequence string to a fixed line width for FASTA output.
 /// If `width` is 0, the sequence is returned unwrapped.
-pub(crate) fn wrap_fasta(seq: &str, width: usize) -> String {
+pub fn wrap_fasta(seq: &str, width: usize) -> String {
     if width == 0 {
         return seq.to_string();
     }
@@ -27,8 +27,48 @@ pub(crate) fn wrap_fasta(seq: &str, width: usize) -> String {
     out
 }
 
+/// Format a single region's extraction as a FASTA entry string.
+fn format_fasta_entry(r: &Region, seq: &str) -> String {
+    let header = match &r.name {
+        Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
+        None => format!(">{}:{}-{}", r.chr, r.start, r.end),
+    };
+    format!("{header}\n{}\n", wrap_fasta(seq, 60))
+}
+
+/// Extract a single region and return the formatted FASTA entry.
+///
+/// Uses a thread-local file handle for reuse across calls on the same thread.
+fn extract_and_format(
+    fasta_path: &Path,
+    fai_index: &HashMap<String, FaiRecord>,
+    r: &Region,
+) -> Result<(Region, String)> {
+    thread_local! {
+        static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+    }
+    TL_FILE.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(
+                File::open(fasta_path)
+                    .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?,
+            );
+        }
+        let f = borrow.as_mut().unwrap();
+        let seq = extract_region(f, fai_index, r)?;
+        let entry = format_fasta_entry(r, &seq);
+        Ok((r.clone(), entry))
+    })
+}
+
 /// Extract and write all sequences to the requested destination.
-pub(crate) fn write_sequences(
+///
+/// For `--output-dir` mode, files are written as each extraction completes,
+/// avoiding the need to hold all sequences in memory simultaneously.
+/// For single-file and stdout output, results are collected to preserve
+/// deterministic (input) order.
+pub fn write_sequences(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
@@ -36,43 +76,22 @@ pub(crate) fn write_sequences(
     output_dir: Option<&Path>,
     is_sv: bool,
 ) -> Result<()> {
-    // Parallel extraction with thread-local file handles.
-    thread_local! {
-        static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
-    }
-    let sequences: Vec<(Region, String)> = regions
-        .par_iter()
-        .map(|r| {
-            TL_FILE.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                if borrow.is_none() {
-                    *borrow =
-                        Some(File::open(fasta_path).with_context(|| {
-                            format!("Cannot open FASTA: {}", fasta_path.display())
-                        })?);
-                }
-                let f = borrow.as_mut().unwrap();
-                let seq = extract_region(f, fai_index, r)?;
-                let header = match &r.name {
-                    Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
-                    None => format!(">{}:{}-{}", r.chr, r.start, r.end),
-                };
-                let fasta_entry = format!("{header}\n{}\n", wrap_fasta(&seq, 60));
-                Ok((r.clone(), fasta_entry))
-            })
-        })
-        .collect::<Result<_>>()?;
-
     match output_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             if is_sv {
-                write_sv_per_file(dir, &sequences)?;
+                write_sv_per_file_streaming(fasta_path, fai_index, regions, dir)?;
             } else {
-                write_per_file(dir, &sequences)?;
+                write_per_file_streaming(fasta_path, fai_index, regions, dir)?;
             }
         }
         None => {
+            // Collect all results to maintain deterministic input order.
+            let sequences: Vec<(Region, String)> = regions
+                .par_iter()
+                .map(|r| extract_and_format(fasta_path, fai_index, r))
+                .collect::<Result<_>>()?;
+
             let mut writer: Box<dyn Write> = match output_file {
                 Some(p) => Box::new(BufWriter::new(File::create(p)?)),
                 None => Box::new(BufWriter::new(io::stdout())),
@@ -86,37 +105,47 @@ pub(crate) fn write_sequences(
     Ok(())
 }
 
-/// Write one FASTA file per region.
-fn write_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
-    sequences
-        .par_iter()
-        .try_for_each(|(region, entry)| -> Result<()> {
-            let filename = match &region.name {
-                Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
-                None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
-            };
-            let mut f = File::create(dir.join(filename))?;
-            f.write_all(entry.as_bytes())?;
-            Ok(())
-        })
+/// Stream one FASTA file per region directly to disk, without collecting all
+/// sequences into memory first.
+fn write_per_file_streaming(
+    fasta_path: &Path,
+    fai_index: &HashMap<String, FaiRecord>,
+    regions: &[Region],
+    dir: &Path,
+) -> Result<()> {
+    regions.par_iter().try_for_each(|r| -> Result<()> {
+        let (region, entry) = extract_and_format(fasta_path, fai_index, r)?;
+        let filename = match &region.name {
+            Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
+            None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
+        };
+        let mut f = File::create(dir.join(filename))?;
+        f.write_all(entry.as_bytes())?;
+        Ok(())
+    })
 }
 
-/// Write one FASTA file per SV pair (two regions per file).
-fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
-    if !sequences.len().is_multiple_of(2) {
+/// Stream one FASTA file per SV pair directly to disk.
+fn write_sv_per_file_streaming(
+    fasta_path: &Path,
+    fai_index: &HashMap<String, FaiRecord>,
+    regions: &[Region],
+    dir: &Path,
+) -> Result<()> {
+    if !regions.len().is_multiple_of(2) {
         return Err(anyhow!(
             "SV extraction produced {} regions (expected even number for pairs)",
-            sequences.len()
+            regions.len()
         ));
     }
 
-    sequences
+    regions
         .chunks(2)
         .collect::<Vec<_>>()
         .par_iter()
         .try_for_each(|pair| -> Result<()> {
-            let (r1, _) = &pair[0];
-            let (r2, _) = &pair[1];
+            let (r1, entry1) = extract_and_format(fasta_path, fai_index, &pair[0])?;
+            let (r2, entry2) = extract_and_format(fasta_path, fai_index, &pair[1])?;
 
             let filename = match (&r1.name, &r2.name) {
                 (Some(n1), Some(n2)) if n1 == n2 => {
@@ -137,15 +166,11 @@ fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
             };
 
             let mut f = File::create(dir.join(filename))?;
-            for (_, entry) in pair.iter() {
-                f.write_all(entry.as_bytes())?;
-            }
+            f.write_all(entry1.as_bytes())?;
+            f.write_all(entry2.as_bytes())?;
             Ok(())
         })
 }
-
-// Need this import for the `with_context` method used in the closure.
-use anyhow::Context;
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 

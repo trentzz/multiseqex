@@ -24,4 +24,4 @@ Move unit tests alongside their modules. Integration tests remain in
 - [x] Each module has its own file with relevant unit tests.
 - [x] All 97 existing tests pass without modification.
 - [x] `cargo clippy -- -D warnings` is clean.
-- [ ] /update has been run after changes.
+- [x] /update has been run after changes.

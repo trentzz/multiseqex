@@ -4,6 +4,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+/// Strand orientation for a genomic region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum Strand {
+    Forward,
+    Reverse,
+    Unspecified,
+}
+
 /// A genomic interval (1-based, inclusive on both ends).
 #[derive(Debug, Clone)]
 pub(crate) struct Region {
@@ -11,6 +20,8 @@ pub(crate) struct Region {
     pub(crate) chr: String,
     pub(crate) start: u64,
     pub(crate) end: u64,
+    #[allow(dead_code)]
+    pub(crate) strand: Strand,
 }
 
 /// Parse comma-separated inline region strings.
@@ -22,12 +33,19 @@ pub(crate) fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Re
 }
 
 /// Parse a file with one region string per line.
+/// If `path` is "-", reads from stdin instead.
 pub(crate) fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let f =
-        File::open(path).with_context(|| format!("Cannot open list file: {}", path.display()))?;
-    BufReader::new(f)
+    let reader: Box<dyn BufRead> = if path == Path::new("-") {
+        Box::new(BufReader::new(std::io::stdin()))
+    } else {
+        let f = File::open(path)
+            .with_context(|| format!("Cannot open list file: {}", path.display()))?;
+        Box::new(BufReader::new(f))
+    };
+    let source = path.display().to_string();
+    reader
         .lines()
-        .map(|l| l.with_context(|| format!("I/O error reading list file: {}", path.display())))
+        .map(|l| l.with_context(|| format!("I/O error reading list file: {source}")))
         .filter_map(|l| match l {
             Err(e) => Some(Err(e)),
             Ok(line) => {
@@ -75,6 +93,7 @@ pub(crate) fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
             chr: chr.to_string(),
             start: min(start, end),
             end: max(start, end),
+            strand: Strand::Unspecified,
         });
     }
 
@@ -98,7 +117,73 @@ pub(crate) fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         chr: chr.to_string(),
         start: pos.saturating_sub(effective_flank).max(1),
         end: pos.saturating_add(effective_flank),
+        strand: Strand::Unspecified,
     })
+}
+
+/// Remove duplicate regions (same chr, start, end). Returns the number of duplicates removed.
+/// Preserves the first occurrence of each unique region.
+#[allow(dead_code)]
+pub(crate) fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
+    use std::collections::HashSet;
+    let original_len = regions.len();
+    let mut seen = HashSet::new();
+    regions.retain(|r| seen.insert((r.chr.clone(), r.start, r.end)));
+    original_len - regions.len()
+}
+
+/// Sort regions by chromosome (natural order) then start position.
+/// Natural order means chr1, chr2, ..., chr10 rather than chr1, chr10, chr2.
+#[allow(dead_code)]
+pub(crate) fn sort_regions(regions: &mut [Region]) {
+    regions.sort_by(|a, b| natural_chr_cmp(&a.chr, &b.chr).then(a.start.cmp(&b.start)));
+}
+
+/// Compare two chromosome names using natural sort order.
+/// Splits each name into text and numeric segments and compares them pairwise.
+fn natural_chr_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+
+    loop {
+        match (ai.peek(), bi.peek()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    // Compare numeric segments.
+                    let an = consume_number(&mut ai);
+                    let bn = consume_number(&mut bi);
+                    match an.cmp(&bn) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    }
+                } else {
+                    ai.next();
+                    bi.next();
+                    match ac.cmp(&bc) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Consume consecutive digits from a peekable char iterator and return as u64.
+fn consume_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
+    let mut n: u64 = 0;
+    while let Some(&c) = it.peek() {
+        if c.is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add(c as u64 - '0' as u64);
+            it.next();
+        } else {
+            break;
+        }
+    }
+    n
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
@@ -224,5 +309,105 @@ mod tests {
             msg.contains("1-based coordinates"),
             "expected 1-based coordinates message, got: {msg}"
         );
+    }
+
+    // ── deduplicate_regions ─────────────────────────────────────────────
+
+    #[test]
+    fn dedup_removes_exact_duplicates() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: Some("foo".into()),
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: None,
+                chr: "chr2".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+        ];
+        let removed = deduplicate_regions(&mut regions);
+        assert_eq!(removed, 1);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].chr, "chr1");
+        assert_eq!(regions[1].chr, "chr2");
+    }
+
+    #[test]
+    fn dedup_no_duplicates() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: None,
+                chr: "chr2".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+        ];
+        let removed = deduplicate_regions(&mut regions);
+        assert_eq!(removed, 0);
+        assert_eq!(regions.len(), 2);
+    }
+
+    // ── sort_regions ────────────────────────────────────────────────────
+
+    #[test]
+    fn sort_natural_chromosome_order() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr10".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: None,
+                chr: "chr2".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 20,
+                end: 30,
+                strand: Strand::Unspecified,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: Strand::Unspecified,
+            },
+        ];
+        sort_regions(&mut regions);
+        assert_eq!(regions[0].chr, "chr1");
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[1].chr, "chr1");
+        assert_eq!(regions[1].start, 20);
+        assert_eq!(regions[2].chr, "chr2");
+        assert_eq!(regions[3].chr, "chr10");
     }
 }
