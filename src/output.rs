@@ -25,12 +25,43 @@ pub fn wrap_fasta(seq: &str, width: usize) -> String {
     out
 }
 
-fn format_fasta_entry(r: &Region, seq: &str) -> String {
+/// Format the strand suffix for a FASTA header.
+fn strand_suffix(r: &Region) -> &'static str {
+    match r.strand {
+        Some('+') => "(+)",
+        Some('-') => "(-)",
+        Some('.') => "(.)",
+        _ => "",
+    }
+}
+
+fn format_fasta_entry(r: &Region, seq: &str, line_width: usize) -> String {
+    let suffix = strand_suffix(r);
     let header = match &r.name {
-        Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
-        None => format!(">{}:{}-{}", r.chr, r.start, r.end),
+        Some(name) => format!(">{name} {}:{}-{}{suffix}", r.chr, r.start, r.end),
+        None => format!(">{}:{}-{}{suffix}", r.chr, r.start, r.end),
     };
-    format!("{header}\n{}\n", wrap_fasta(seq, 60))
+    format!("{header}\n{}\n", wrap_fasta(seq, line_width))
+}
+
+/// Format a region as a TSV line: chr, start, end, name, sequence.
+fn format_tab_entry(r: &Region, seq: &str) -> String {
+    let name = r.name.as_deref().unwrap_or(".");
+    format!("{}\t{}\t{}\t{}\t{}\n", r.chr, r.start, r.end, name, seq)
+}
+
+/// Apply per-region strand reverse complement and global --rc flag.
+///
+/// When a region has strand == Some('-'), we reverse-complement it first.
+/// If --rc is also set, the two cancel out (- strand + --rc = forward).
+fn apply_strand_and_rc(seq: String, r: &Region, rc: bool) -> String {
+    let strand_rc = r.strand == Some('-');
+    // XOR: if both strand_rc and global rc are set, they cancel out.
+    if strand_rc ^ rc {
+        reverse_complement(&seq)
+    } else {
+        seq
+    }
 }
 
 fn extract_and_format(
@@ -38,6 +69,7 @@ fn extract_and_format(
     fai_index: &HashMap<String, FaiRecord>,
     r: &Region,
     rc: bool,
+    line_width: usize,
 ) -> Result<(Region, String)> {
     thread_local! {
         static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
@@ -52,12 +84,13 @@ fn extract_and_format(
         }
         let f = borrow.as_mut().unwrap();
         let seq = extract_region(f, fai_index, r)?;
-        let seq = if rc { reverse_complement(&seq) } else { seq };
-        let entry = format_fasta_entry(r, &seq);
+        let seq = apply_strand_and_rc(seq, r, rc);
+        let entry = format_fasta_entry(r, &seq, line_width);
         Ok((r.clone(), entry))
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_sequences(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
@@ -66,18 +99,31 @@ pub fn write_sequences(
     output_dir: Option<&Path>,
     is_sv: bool,
     rc: bool,
+    line_width: usize,
+    tab_out: bool,
 ) -> Result<()> {
     match output_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
             if is_sv {
-                write_sv_per_file_streaming(fasta_path, fai_index, regions, dir, rc)?;
+                write_sv_per_file_streaming(fasta_path, fai_index, regions, dir, rc, line_width)?;
             } else {
-                write_per_file_streaming(fasta_path, fai_index, regions, dir, rc)?;
+                write_per_file_streaming(fasta_path, fai_index, regions, dir, rc, line_width)?;
             }
         }
         None => {
-            write_streaming_ordered(fasta_path, fai_index, regions, output_file, rc)?;
+            if tab_out {
+                write_tab_output(fasta_path, fai_index, regions, output_file, rc)?;
+            } else {
+                write_streaming_ordered(
+                    fasta_path,
+                    fai_index,
+                    regions,
+                    output_file,
+                    rc,
+                    line_width,
+                )?;
+            }
         }
     }
     Ok(())
@@ -91,6 +137,55 @@ pub fn write_sequences(
 /// of regions alone. For very large extraction jobs where memory is a
 /// concern, prefer `--output-dir` which streams each region independently.
 fn write_streaming_ordered(
+    fasta_path: &Path,
+    fai_index: &HashMap<String, FaiRecord>,
+    regions: &[Region],
+    output_file: Option<&Path>,
+    rc: bool,
+    line_width: usize,
+) -> Result<()> {
+    let groups = build_bulk_groups(regions, fai_index)?;
+    let slots: Vec<Mutex<Option<String>>> = (0..regions.len()).map(|_| Mutex::new(None)).collect();
+    groups.par_iter().try_for_each(|group| -> Result<()> {
+        thread_local! {
+            static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
+        }
+        TL_FILE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            if borrow.is_none() {
+                *borrow = Some(
+                    File::open(fasta_path)
+                        .with_context(|| format!("Cannot open FASTA: {}", fasta_path.display()))?,
+                );
+            }
+            let f = borrow.as_mut().unwrap();
+            let extracted = extract_bulk_group(f, group, regions)?;
+            for (orig_idx, seq) in extracted {
+                let r = &regions[orig_idx];
+                let seq = apply_strand_and_rc(seq, r, rc);
+                let entry = format_fasta_entry(r, &seq, line_width);
+                let mut slot = slots[orig_idx].lock().unwrap();
+                *slot = Some(entry);
+            }
+            Ok(())
+        })
+    })?;
+    let mut writer: Box<dyn Write> = match output_file {
+        Some(p) => Box::new(BufWriter::new(File::create(p)?)),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    for slot in &slots {
+        let guard = slot.lock().unwrap();
+        if let Some(entry) = guard.as_ref() {
+            writer.write_all(entry.as_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write TSV output: chr, start, end, name, sequence.
+fn write_tab_output(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,
     regions: &[Region],
@@ -115,8 +210,8 @@ fn write_streaming_ordered(
             let extracted = extract_bulk_group(f, group, regions)?;
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
-                let seq = if rc { reverse_complement(&seq) } else { seq };
-                let entry = format_fasta_entry(r, &seq);
+                let seq = apply_strand_and_rc(seq, r, rc);
+                let entry = format_tab_entry(r, &seq);
                 let mut slot = slots[orig_idx].lock().unwrap();
                 *slot = Some(entry);
             }
@@ -143,9 +238,10 @@ fn write_per_file_streaming(
     regions: &[Region],
     dir: &Path,
     rc: bool,
+    line_width: usize,
 ) -> Result<()> {
     regions.par_iter().try_for_each(|r| -> Result<()> {
-        let (region, entry) = extract_and_format(fasta_path, fai_index, r, rc)?;
+        let (region, entry) = extract_and_format(fasta_path, fai_index, r, rc, line_width)?;
         let filename = match &region.name {
             Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
             None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
@@ -162,6 +258,7 @@ fn write_sv_per_file_streaming(
     regions: &[Region],
     dir: &Path,
     rc: bool,
+    line_width: usize,
 ) -> Result<()> {
     if !regions.len().is_multiple_of(2) {
         return Err(anyhow!(
@@ -174,8 +271,8 @@ fn write_sv_per_file_streaming(
         .collect::<Vec<_>>()
         .par_iter()
         .try_for_each(|pair| -> Result<()> {
-            let (r1, entry1) = extract_and_format(fasta_path, fai_index, &pair[0], rc)?;
-            let (r2, entry2) = extract_and_format(fasta_path, fai_index, &pair[1], rc)?;
+            let (r1, entry1) = extract_and_format(fasta_path, fai_index, &pair[0], rc, line_width)?;
+            let (r2, entry2) = extract_and_format(fasta_path, fai_index, &pair[1], rc, line_width)?;
             let filename = match (&r1.name, &r2.name) {
                 (Some(n1), Some(n2)) if n1 == n2 => format!(
                     "{n1}_{}_{}_{}_{}_{}_{}.fa",
@@ -231,6 +328,109 @@ mod tests {
     }
 
     #[test]
+    fn strand_suffix_plus() {
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: Some('+'),
+        };
+        assert_eq!(strand_suffix(&r), "(+)");
+    }
+
+    #[test]
+    fn strand_suffix_minus() {
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: Some('-'),
+        };
+        assert_eq!(strand_suffix(&r), "(-)");
+    }
+
+    #[test]
+    fn strand_suffix_none() {
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: None,
+        };
+        assert_eq!(strand_suffix(&r), "");
+    }
+
+    #[test]
+    fn apply_strand_and_rc_minus_strand_only() {
+        // Minus strand alone should reverse complement.
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 4,
+            strand: Some('-'),
+        };
+        assert_eq!(apply_strand_and_rc("ACGT".to_string(), &r, false), "ACGT");
+        // ACGT RC = ACGT (palindrome). Use a non-palindrome.
+        assert_eq!(apply_strand_and_rc("AAAC".to_string(), &r, false), "GTTT");
+    }
+
+    #[test]
+    fn apply_strand_and_rc_cancel() {
+        // Minus strand + global RC cancel out (XOR).
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 4,
+            strand: Some('-'),
+        };
+        assert_eq!(apply_strand_and_rc("AAAC".to_string(), &r, true), "AAAC");
+    }
+
+    #[test]
+    fn format_fasta_entry_with_strand() {
+        let r = Region {
+            name: Some("gene1".into()),
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: Some('+'),
+        };
+        let entry = format_fasta_entry(&r, "AAACCCGGGT", 60);
+        assert!(entry.starts_with(">gene1 chr1:1-10(+)\n"));
+    }
+
+    #[test]
+    fn format_tab_entry_basic() {
+        let r = Region {
+            name: Some("gene1".into()),
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: None,
+        };
+        let entry = format_tab_entry(&r, "AAACCCGGGT");
+        assert_eq!(entry, "chr1\t1\t10\tgene1\tAAACCCGGGT\n");
+    }
+
+    #[test]
+    fn format_tab_entry_no_name() {
+        let r = Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 10,
+            strand: None,
+        };
+        let entry = format_tab_entry(&r, "AAACCCGGGT");
+        assert_eq!(entry, "chr1\t1\t10\t.\tAAACCCGGGT\n");
+    }
+
+    #[test]
     fn streaming_output_preserves_input_order() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(tmp, ">chr1\nAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAACCCC\n>chr2\nTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTTAAAA\n>chr3\nGGGGTTTTAAAACCCCGGGGTTTTAAAACCCCGGGGTTTT\n").unwrap();
@@ -283,10 +483,12 @@ mod tests {
             chr: chr.to_string(),
             start,
             end,
+            strand: None,
         })
         .collect();
         let out_file = tempfile::NamedTempFile::new().unwrap();
-        write_streaming_ordered(tmp.path(), &fai, &regions, Some(out_file.path()), false).unwrap();
+        write_streaming_ordered(tmp.path(), &fai, &regions, Some(out_file.path()), false, 60)
+            .unwrap();
         let output = std::fs::read_to_string(out_file.path()).unwrap();
         let headers: Vec<&str> = output.lines().filter(|l| l.starts_with('>')).collect();
         let expected: Vec<String> = regions

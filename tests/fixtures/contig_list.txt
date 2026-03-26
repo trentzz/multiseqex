@@ -1,0 +1,3 @@
+# Contigs to extract
+chr1
+chr3

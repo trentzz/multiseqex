@@ -166,6 +166,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 0,
             end: 5,
+            strand: None,
         };
         let mut f = File::open(tmp.path()).unwrap();
         let err = extract_region(&mut f, &fai, &r).unwrap_err();
@@ -193,18 +194,21 @@ mod tests {
                 chr: "chr1".to_string(),
                 start: 1,
                 end: 20,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr1".to_string(),
                 start: 15,
                 end: 40,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr1".to_string(),
                 start: 50,
                 end: 80,
+                strand: None,
             },
         ];
         let mut individual = Vec::new();

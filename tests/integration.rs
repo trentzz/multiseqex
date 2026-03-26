@@ -1142,3 +1142,372 @@ fn bed_with_comments_and_blanks() {
         .stdout(predicate::str::contains(">chr1:1-10"))
         .stdout(predicate::str::contains(">chr2:1-10"));
 }
+
+// ─── Feature 1: Per-region strand from BED STRAND column ─────────────────────
+
+#[test]
+fn bed_strand_plus_shows_in_header() {
+    // BED with strand column: + strand should appear in header.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions_strand.bed")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">geneA chr1:1-10(+)"))
+        .stdout(predicate::str::contains(">geneB chr2:1-10(-)"));
+}
+
+#[test]
+fn bed_strand_minus_reverse_complements() {
+    // chr2:1-10 = TTTTTTTTTT. RC = AAAAAAAAAA.
+    // Minus strand region should be reverse-complemented.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions_strand.bed")])
+        .assert()
+        .success()
+        // geneA is + strand, so sequence stays: AAACCCGGGT
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        // geneB is - strand, TTTTTTTTTT RC = AAAAAAAAAA
+        .stdout(predicate::str::contains("AAAAAAAAAA"));
+}
+
+#[test]
+fn bed_strand_minus_plus_rc_cancel() {
+    // Minus strand + --rc should cancel out. geneB chr2:1-10 = TTTTTTTTTT,
+    // minus strand RC = AAAAAAAAAA, then --rc again = TTTTTTTTTT (original).
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions_strand.bed"), "--rc"])
+        .assert()
+        .success()
+        // geneB: - strand + --rc cancel, so original TTTTTTTTTT
+        .stdout(predicate::str::contains("TTTTTTTTTT"));
+}
+
+#[test]
+fn table_with_strand_column() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("strand.csv");
+    // chr1:1-10 = AAACCCGGGT. Minus strand: RC = ACCCGGGTTT.
+    fs::write(
+        &csv_path,
+        "CHROM,START,END,NAME,STRAND\nchr1,1,10,gene1,-\n",
+    )
+    .unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--table", csv_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">gene1 chr1:1-10(-)"))
+        .stdout(predicate::str::contains("ACCCGGGTTT"));
+}
+
+// ─── Feature 3: Output format control ────────────────────────────────────────
+
+#[test]
+fn line_width_flag() {
+    // Extract 80bp with --line-width 20: should produce 4 lines of 20.
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-80", "--line-width", "20"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    // line 0 = header, lines 1-4 = sequence (20 chars each)
+    assert_eq!(lines.len(), 5, "Expected 1 header + 4 seq lines");
+    assert_eq!(lines[1].len(), 20);
+    assert_eq!(lines[4].len(), 20);
+}
+
+#[test]
+fn no_wrap_flag() {
+    // Extract 80bp with --no-wrap: sequence should be on one line.
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-80", "--no-wrap"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    // line 0 = header, line 1 = full 80bp sequence
+    assert_eq!(lines.len(), 2, "Expected 1 header + 1 unwrapped seq line");
+    assert_eq!(lines[1].len(), 80);
+}
+
+#[test]
+fn tab_out_flag() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:1-10", "--tab-out"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "Expected 2 TSV lines");
+    // Verify tab-separated format.
+    let fields: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(fields.len(), 5, "Expected 5 TSV columns");
+    assert_eq!(fields[0], "chr1");
+    assert_eq!(fields[1], "1");
+    assert_eq!(fields[2], "10");
+    assert_eq!(fields[3], ".");
+    assert_eq!(fields[4], "AAACCCGGGT");
+}
+
+#[test]
+fn tab_out_conflicts_with_output_dir() {
+    let tmp = TempDir::new().unwrap();
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--tab-out"])
+        .args(["--output-dir", tmp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+// ─── Feature 5: Merge overlapping regions ────────────────────────────────────
+
+#[test]
+fn merge_overlapping_regions() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr1:5-20", "--merge"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(
+        headers.len(),
+        1,
+        "Overlapping regions should merge into one"
+    );
+    assert_eq!(headers[0], ">chr1:1-20");
+}
+
+#[test]
+fn merge_with_distance() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10,chr1:15-25",
+            "--merge",
+            "--merge-distance",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(
+        headers.len(),
+        1,
+        "Nearby regions should merge with distance"
+    );
+    assert_eq!(headers[0], ">chr1:1-25");
+}
+
+#[test]
+fn merge_does_not_merge_different_chroms() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr2:5-15", "--merge"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(headers.len(), 2, "Different chromosomes should not merge");
+}
+
+#[test]
+fn merge_implies_sort() {
+    // Regions given out of order. --merge should sort them first.
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:11-20,chr1:1-10,chr1:5-15", "--merge"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    // Should merge all three overlapping regions into one.
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0], ">chr1:1-20");
+}
+
+#[test]
+fn merge_distance_without_merge_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--merge-distance", "5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--merge-distance requires --merge",
+        ));
+}
+
+// ─── Feature 6: Whole-contig extraction ──────────────────────────────────────
+
+#[test]
+fn contigs_flag_extracts_whole_contig() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--contigs", "chr1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // chr1 is 204 bases long.
+    assert!(stdout.contains(">chr1:1-204"));
+}
+
+#[test]
+fn contigs_flag_multiple() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--contigs", "chr1,chr3"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(">chr1:1-204"));
+    assert!(stdout.contains(">chr3:1-72"));
+}
+
+#[test]
+fn contigs_flag_unknown_contig_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--contigs", "chrZ"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found in FAI"));
+}
+
+#[test]
+fn contig_list_file() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--contig-list", &fixture("contig_list.txt")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-204"))
+        .stdout(predicate::str::contains(">chr3:1-72"));
+}
+
+#[test]
+fn contigs_combined_with_regions() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--contigs", "chr3", "--regions", "chr1:1-10"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(">chr1:1-10"));
+    assert!(stdout.contains(">chr3:1-72"));
+}
+
+#[test]
+fn contigs_conflicts_with_sv_table() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--contigs",
+            "chr1",
+            "--sv-table",
+            &fixture("sv_table_range.tsv"),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+// ─── Feature 7: Asymmetric flanking ──────────────────────────────────────────
+
+#[test]
+fn flank_left_right_bed() {
+    // BED: chr1 100 200 -> 1-based [101, 200]
+    // With --flank-left 10 --flank-right 30: start=91, end=230 -> clamped to chr1 length
+    let tmp = TempDir::new().unwrap();
+    let bed_path = tmp.path().join("asym.bed");
+    fs::write(&bed_path, "chr1\t100\t110\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--bed",
+            bed_path.to_str().unwrap(),
+            "--flank-left",
+            "10",
+            "--flank-right",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:91-130"));
+}
+
+#[test]
+fn flank_left_right_table() {
+    let tmp = TempDir::new().unwrap();
+    let csv_path = tmp.path().join("asym.csv");
+    fs::write(&csv_path, "CHROM,POS\nchr1,50\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--table",
+            csv_path.to_str().unwrap(),
+            "--flank-left",
+            "10",
+            "--flank-right",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:40-70"));
+}
+
+#[test]
+fn flank_conflicts_with_flank_left_right() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--flank",
+            "5",
+            "--flank-left",
+            "3",
+            "--flank-right",
+            "7",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn flank_left_without_right_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--flank-left", "5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--flank-left and --flank-right must be specified together",
+        ));
+}

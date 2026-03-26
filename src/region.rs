@@ -11,6 +11,8 @@ pub struct Region {
     pub chr: String,
     pub start: u64,
     pub end: u64,
+    /// Per-region strand: '+', '-', or '.' (unstranded). None means unspecified.
+    pub strand: Option<char>,
 }
 
 /// Parse comma-separated inline region strings.
@@ -50,6 +52,24 @@ pub fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>
         .collect()
 }
 
+/// Resolve separate left/right flank values from the CLI flags.
+///
+/// When `flank_left` and `flank_right` are both `None`, falls back to the
+/// symmetric `flank` value. Returns `(left, right)`.
+pub fn resolve_flanks(
+    flank: Option<u64>,
+    flank_left: Option<u64>,
+    flank_right: Option<u64>,
+) -> (u64, u64) {
+    match (flank_left, flank_right) {
+        (Some(l), Some(r)) => (l, r),
+        _ => {
+            let f = flank.unwrap_or(0);
+            (f, f)
+        }
+    }
+}
+
 /// Parse a single region string: `chr:start-end` or `chr:pos+flank`.
 pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
     let (chr, rest) = s
@@ -82,6 +102,7 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
             chr: chr.to_string(),
             start: min(start, end),
             end: max(start, end),
+            strand: None,
         });
     }
 
@@ -105,20 +126,40 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         chr: chr.to_string(),
         start: pos.saturating_sub(effective_flank).max(1),
         end: pos.saturating_add(effective_flank),
+        strand: None,
     })
 }
 
-/// Parse a BED file (tab-separated: chr, start, end, optional name).
+/// Parse a strand character from a BED field. Accepts '+', '-', '.'.
+/// Returns `None` for unrecognised values or empty strings.
+fn parse_strand(s: &str) -> Option<char> {
+    match s.trim() {
+        "+" => Some('+'),
+        "-" => Some('-'),
+        "." => Some('.'),
+        _ => None,
+    }
+}
+
+/// Parse a BED file (tab-separated: chr, start, end, optional name, score, strand).
 ///
 /// BED uses 0-based half-open coordinates. We convert to 1-based inclusive
 /// by adding 1 to start (end stays the same, since half-open end equals
 /// inclusive end in 1-based).
+/// If column 6 (strand) is present, it is read. Columns 4 (name) and 5
+/// (score) are also read where available, though score is discarded.
 /// Skips comment lines (starting with #) and blank lines.
-pub fn parse_regions_bed(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
+pub fn parse_regions_bed(
+    path: &Path,
+    flank: Option<u64>,
+    flank_left: Option<u64>,
+    flank_right: Option<u64>,
+) -> Result<Vec<Region>> {
     let f =
         File::open(path).with_context(|| format!("Cannot open BED file: {}", path.display()))?;
     let reader = BufReader::new(f);
     let mut regions = Vec::new();
+    let (fl, fr) = resolve_flanks(flank, flank_left, flank_right);
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result
@@ -171,9 +212,19 @@ pub fn parse_regions_bed(path: &Path, flank: Option<u64>) -> Result<Vec<Region>>
         } else {
             None
         };
+        // Column 6 is strand (index 5). Column 5 (score) is skipped.
+        let strand = if fields.len() >= 6 {
+            parse_strand(fields[5])
+        } else {
+            None
+        };
         // Apply flanking after the 0-based to 1-based conversion.
-        let (final_start, final_end) = if let Some(f) = flank {
-            (start_1based.saturating_sub(f).max(1), end.saturating_add(f))
+        let has_flank = flank.is_some() || flank_left.is_some() || flank_right.is_some();
+        let (final_start, final_end) = if has_flank {
+            (
+                start_1based.saturating_sub(fl).max(1),
+                end.saturating_add(fr),
+            )
         } else {
             (start_1based, end)
         };
@@ -182,9 +233,37 @@ pub fn parse_regions_bed(path: &Path, flank: Option<u64>) -> Result<Vec<Region>>
             chr,
             start: final_start,
             end: final_end,
+            strand,
         });
     }
     Ok(regions)
+}
+
+/// Merge overlapping or book-ended regions on the same chromosome.
+///
+/// Sorts regions by chromosome (natural order) then start position, then
+/// sweeps through and merges where `next.start <= prev.end + distance`.
+/// Names and strands are taken from the first region in each merged group.
+pub fn merge_regions(regions: &mut Vec<Region>, distance: u64) {
+    if regions.len() <= 1 {
+        return;
+    }
+    sort_regions(regions);
+    let mut merged: Vec<Region> = Vec::with_capacity(regions.len());
+    let mut current = regions[0].clone();
+    for r in regions.iter().skip(1) {
+        if r.chr == current.chr && r.start <= current.end.saturating_add(distance) {
+            // Extend current region.
+            if r.end > current.end {
+                current.end = r.end;
+            }
+        } else {
+            merged.push(current);
+            current = r.clone();
+        }
+    }
+    merged.push(current);
+    *regions = merged;
 }
 
 /// Remove duplicate regions (same chr, start, end). Returns the number of duplicates removed.
@@ -389,18 +468,21 @@ mod tests {
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
             Region {
                 name: Some("foo".into()),
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
@@ -418,12 +500,14 @@ mod tests {
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
@@ -439,7 +523,7 @@ mod tests {
     fn bed_valid_region() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
-        let regions = parse_regions_bed(tmp.path(), None).unwrap();
+        let regions = parse_regions_bed(tmp.path(), None, None, None).unwrap();
         assert_eq!(regions.len(), 1);
         // BED 0-based half-open [100, 200) -> 1-based inclusive [101, 200]
         assert_eq!(regions[0].start, 101);
@@ -451,7 +535,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // start == end == 5 in BED means an empty interval.
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t5\t5\n").unwrap();
-        let err = parse_regions_bed(tmp.path(), None).unwrap_err();
+        let err = parse_regions_bed(tmp.path(), None, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("empty interval"),
@@ -464,7 +548,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // start=10, end=5 in BED is malformed.
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t10\t5\n").unwrap();
-        let err = parse_regions_bed(tmp.path(), None).unwrap_err();
+        let err = parse_regions_bed(tmp.path(), None, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("malformed"),
@@ -478,7 +562,7 @@ mod tests {
         // BED: chr1 100 200 (0-based half-open) -> 1-based [101, 200]
         // With flank=50: start = 101 - 50 = 51, end = 200 + 50 = 250
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
-        let regions = parse_regions_bed(tmp.path(), Some(50)).unwrap();
+        let regions = parse_regions_bed(tmp.path(), Some(50), None, None).unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start, 51);
         assert_eq!(regions[0].end, 250);
@@ -490,7 +574,7 @@ mod tests {
         // BED: chr1 0 10 -> 1-based [1, 10]
         // With flank=5: start = max(1 - 5, 1) = 1, end = 10 + 5 = 15
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t0\t10\n").unwrap();
-        let regions = parse_regions_bed(tmp.path(), Some(5)).unwrap();
+        let regions = parse_regions_bed(tmp.path(), Some(5), None, None).unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start, 1);
         assert_eq!(regions[0].end, 15);
@@ -506,24 +590,28 @@ mod tests {
                 chr: "chr10".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr1".into(),
                 start: 20,
                 end: 30,
+                strand: None,
             },
             Region {
                 name: None,
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
+                strand: None,
             },
         ];
         sort_regions(&mut regions);
@@ -533,5 +621,164 @@ mod tests {
         assert_eq!(regions[1].start, 20);
         assert_eq!(regions[2].chr, "chr2");
         assert_eq!(regions[3].chr, "chr10");
+    }
+
+    // ── strand parsing in BED ──────────────────────────────────────────
+
+    #[test]
+    fn bed_parses_strand_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut tmp.as_file(),
+            b"chr1\t0\t100\tgene1\t0\t+\nchr2\t0\t100\tgene2\t0\t-\nchr3\t0\t100\tgene3\t0\t.\n",
+        )
+        .unwrap();
+        let regions = parse_regions_bed(tmp.path(), None, None, None).unwrap();
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0].strand, Some('+'));
+        assert_eq!(regions[1].strand, Some('-'));
+        assert_eq!(regions[2].strand, Some('.'));
+    }
+
+    #[test]
+    fn bed_without_strand_gives_none() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t0\t100\n").unwrap();
+        let regions = parse_regions_bed(tmp.path(), None, None, None).unwrap();
+        assert_eq!(regions[0].strand, None);
+    }
+
+    // ── asymmetric flanking ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_flanks_symmetric() {
+        assert_eq!(resolve_flanks(Some(10), None, None), (10, 10));
+    }
+
+    #[test]
+    fn resolve_flanks_asymmetric() {
+        assert_eq!(resolve_flanks(Some(10), Some(5), Some(20)), (5, 20));
+    }
+
+    #[test]
+    fn resolve_flanks_none() {
+        assert_eq!(resolve_flanks(None, None, None), (0, 0));
+    }
+
+    #[test]
+    fn bed_asymmetric_flanking() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // BED: chr1 100 200 -> 1-based [101, 200]
+        // With flank_left=10, flank_right=30: start = 101-10 = 91, end = 200+30 = 230
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
+        let regions = parse_regions_bed(tmp.path(), None, Some(10), Some(30)).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 91);
+        assert_eq!(regions[0].end, 230);
+    }
+
+    // ── merge_regions ──────────────────────────────────────────────────
+
+    #[test]
+    fn merge_overlapping() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: None,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 5,
+                end: 15,
+                strand: None,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 20,
+                end: 30,
+                strand: None,
+            },
+        ];
+        merge_regions(&mut regions, 0);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[0].end, 15);
+        assert_eq!(regions[1].start, 20);
+        assert_eq!(regions[1].end, 30);
+    }
+
+    #[test]
+    fn merge_with_distance() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: None,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 15,
+                end: 20,
+                strand: None,
+            },
+        ];
+        merge_regions(&mut regions, 5);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[0].end, 20);
+    }
+
+    #[test]
+    fn merge_different_chroms_not_merged() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: None,
+            },
+            Region {
+                name: None,
+                chr: "chr2".into(),
+                start: 5,
+                end: 15,
+                strand: None,
+            },
+        ];
+        merge_regions(&mut regions, 0);
+        assert_eq!(regions.len(), 2);
+    }
+
+    #[test]
+    fn merge_book_ended() {
+        let mut regions = vec![
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 1,
+                end: 10,
+                strand: None,
+            },
+            Region {
+                name: None,
+                chr: "chr1".into(),
+                start: 10,
+                end: 20,
+                strand: None,
+            },
+        ];
+        merge_regions(&mut regions, 0);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[0].end, 20);
     }
 }

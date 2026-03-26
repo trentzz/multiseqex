@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use crate::region::Region;
+use crate::region::{Region, resolve_flanks};
 
 /// Build a case-insensitive header-name to column-index map.
 pub fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
@@ -117,10 +117,24 @@ enum TableMode {
     Position { pos_idx: usize },
 }
 
-/// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME.
+/// Read an optional STRAND field (returns `None` if the column is absent or not +/-/.).
+fn read_optional_strand(rec: &csv::StringRecord, strand_idx: Option<usize>) -> Option<char> {
+    strand_idx.and_then(|idx| {
+        rec.get(idx).and_then(|v| match v.trim() {
+            "+" => Some('+'),
+            "-" => Some('-'),
+            "." => Some('.'),
+            _ => None,
+        })
+    })
+}
+
+/// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME, STRAND.
 pub fn parse_regions_table(
     path: &Path,
     flank: Option<u64>,
+    flank_left: Option<u64>,
+    flank_right: Option<u64>,
     cli_delimiter: Option<&str>,
 ) -> Result<Vec<Region>> {
     let delim = detect_delimiter(path, cli_delimiter)?;
@@ -135,6 +149,7 @@ pub fn parse_regions_table(
 
     let chrom_idx = require_column(&hmap, "CHROM", &headers)?;
     let name_idx = hmap.get("NAME").copied();
+    let strand_idx = hmap.get("STRAND").copied();
 
     let has_start = hmap.get("START").copied();
     let has_end = hmap.get("END").copied();
@@ -164,12 +179,12 @@ pub fn parse_regions_table(
         }
     };
 
-    if matches!(mode, TableMode::Position { .. }) && flank.is_none() {
+    if matches!(mode, TableMode::Position { .. }) && flank.is_none() && flank_left.is_none() {
         return Err(anyhow!(
             "--flank is required when table uses POS column (position mode)"
         ));
     }
-    let flank = flank.unwrap_or(0);
+    let (fl, fr) = resolve_flanks(flank, flank_left, flank_right);
 
     let mut out = Vec::new();
     for (i, rec) in rdr.records().enumerate() {
@@ -177,6 +192,7 @@ pub fn parse_regions_table(
         let row = i + 2;
         let chr = read_string_field(&rec, chrom_idx)?;
         let name = read_optional_name(&rec, name_idx);
+        let strand = read_optional_strand(&rec, strand_idx);
 
         let region = match &mode {
             TableMode::Range { start_idx, end_idx } => {
@@ -198,6 +214,7 @@ pub fn parse_regions_table(
                     chr,
                     start: min(s, e),
                     end: max(s, e),
+                    strand,
                 }
             }
             TableMode::Position { pos_idx } => {
@@ -211,8 +228,9 @@ pub fn parse_regions_table(
                 Region {
                     name,
                     chr,
-                    start: p.saturating_sub(flank).max(1),
-                    end: p.saturating_add(flank),
+                    start: p.saturating_sub(fl).max(1),
+                    end: p.saturating_add(fr),
+                    strand,
                 }
             }
         };
@@ -238,6 +256,8 @@ enum SvMode {
 pub fn parse_regions_sv_table(
     path: &Path,
     flank: Option<u64>,
+    flank_left: Option<u64>,
+    flank_right: Option<u64>,
     cli_delimiter: Option<&str>,
 ) -> Result<Vec<Region>> {
     let delim = detect_delimiter(path, cli_delimiter)?;
@@ -253,6 +273,7 @@ pub fn parse_regions_sv_table(
     let chrom_left_idx = require_column(&hmap, "CHROM_LEFT", &headers)?;
     let chrom_right_idx = require_column(&hmap, "CHROM_RIGHT", &headers)?;
     let name_idx = hmap.get("NAME").copied();
+    let strand_idx = hmap.get("STRAND").copied();
 
     let has_sl = hmap.get("START_LEFT").copied();
     let has_el = hmap.get("END_LEFT").copied();
@@ -280,12 +301,12 @@ pub fn parse_regions_sv_table(
         }
     };
 
-    if matches!(mode, SvMode::Position { .. }) && flank.is_none() {
+    if matches!(mode, SvMode::Position { .. }) && flank.is_none() && flank_left.is_none() {
         return Err(anyhow!(
             "--flank is required when SV table uses POS_LEFT/POS_RIGHT (position mode)"
         ));
     }
-    let flank = flank.unwrap_or(0);
+    let (fl, fr) = resolve_flanks(flank, flank_left, flank_right);
 
     let mut out = Vec::new();
     for (i, rec) in rdr.records().enumerate() {
@@ -294,6 +315,7 @@ pub fn parse_regions_sv_table(
         let chr_left = read_string_field(&rec, chrom_left_idx)?;
         let chr_right = read_string_field(&rec, chrom_right_idx)?;
         let name = read_optional_name(&rec, name_idx);
+        let strand = read_optional_strand(&rec, strand_idx);
 
         match &mode {
             SvMode::Range {
@@ -324,12 +346,14 @@ pub fn parse_regions_sv_table(
                     chr: chr_left,
                     start: min(sl, el),
                     end: max(sl, el),
+                    strand,
                 });
                 out.push(Region {
                     name,
                     chr: chr_right,
                     start: min(sr, er),
                     end: max(sr, er),
+                    strand,
                 });
             }
             SvMode::Position {
@@ -349,14 +373,16 @@ pub fn parse_regions_sv_table(
                 out.push(Region {
                     name: name.clone(),
                     chr: chr_left,
-                    start: pl.saturating_sub(flank).max(1),
-                    end: pl.saturating_add(flank),
+                    start: pl.saturating_sub(fl).max(1),
+                    end: pl.saturating_add(fr),
+                    strand,
                 });
                 out.push(Region {
                     name,
                     chr: chr_right,
-                    start: pr.saturating_sub(flank).max(1),
-                    end: pr.saturating_add(flank),
+                    start: pr.saturating_sub(fl).max(1),
+                    end: pr.saturating_add(fr),
+                    strand,
                 });
             }
         }
