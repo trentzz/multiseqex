@@ -5,8 +5,6 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::fai::FaiRecord;
 use crate::region::Region;
-#[cfg(test)]
-use crate::region::Strand;
 
 const BULK_READ_GAP_THRESHOLD: u64 = 8192;
 
@@ -168,7 +166,6 @@ mod tests {
             chr: "chr1".to_string(),
             start: 0,
             end: 5,
-            strand: Strand::Unspecified,
         };
         let mut f = File::open(tmp.path()).unwrap();
         let err = extract_region(&mut f, &fai, &r).unwrap_err();
@@ -196,21 +193,18 @@ mod tests {
                 chr: "chr1".to_string(),
                 start: 1,
                 end: 20,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr1".to_string(),
                 start: 15,
                 end: 40,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr1".to_string(),
                 start: 50,
                 end: 80,
-                strand: Strand::Unspecified,
             },
         ];
         let mut individual = Vec::new();

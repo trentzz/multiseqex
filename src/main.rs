@@ -57,7 +57,8 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["regions", "table", "list"])]
     sv_table: Option<PathBuf>,
 
-    /// Flank size for position-mode tables (required with POS columns).
+    /// Flank size for position-mode regions (POS columns in tables and
+    /// pos+flank inline syntax). Has no effect on BED or range-format regions.
     #[arg(long)]
     flank: Option<u64>,
 
@@ -112,6 +113,27 @@ fn main() -> Result<()> {
         && !cli.quiet
     {
         eprintln!("Warning: failed to build thread pool with {t} threads: {e}");
+    }
+
+    // --delimiter only makes sense with --table or --sv-table.
+    if cli.delimiter.is_some() && cli.table.is_none() && cli.sv_table.is_none() {
+        return Err(anyhow!("--delimiter requires --table or --sv-table"));
+    }
+
+    // --dedup/--sort with --sv-table --output-dir would break paired region
+    // ordering. Forbid this combination.
+    if (cli.deduplicate || cli.sort) && cli.sv_table.is_some() && cli.output_dir.is_some() {
+        let flag = if cli.deduplicate && cli.sort {
+            "--dedup and --sort"
+        } else if cli.deduplicate {
+            "--dedup"
+        } else {
+            "--sort"
+        };
+        return Err(anyhow!(
+            "{flag} cannot be used with --sv-table --output-dir because they break \
+             the paired region invariant (pairs may be deduplicated or reordered)"
+        ));
     }
 
     detect_gzip_and_reject(&cli.fasta)?;

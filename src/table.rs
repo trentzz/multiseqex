@@ -1,4 +1,3 @@
-use crate::region::Strand;
 use anyhow::{Context, Result, anyhow};
 use std::cmp::{max, min};
 use std::collections::HashMap;
@@ -199,7 +198,6 @@ pub fn parse_regions_table(
                     chr,
                     start: min(s, e),
                     end: max(s, e),
-                    strand: Strand::Unspecified,
                 }
             }
             TableMode::Position { pos_idx } => {
@@ -215,7 +213,6 @@ pub fn parse_regions_table(
                     chr,
                     start: p.saturating_sub(flank).max(1),
                     end: p.saturating_add(flank),
-                    strand: Strand::Unspecified,
                 }
             }
         };
@@ -327,14 +324,12 @@ pub fn parse_regions_sv_table(
                     chr: chr_left,
                     start: min(sl, el),
                     end: max(sl, el),
-                    strand: Strand::Unspecified,
                 });
                 out.push(Region {
                     name,
                     chr: chr_right,
                     start: min(sr, er),
                     end: max(sr, er),
-                    strand: Strand::Unspecified,
                 });
             }
             SvMode::Position {
@@ -356,14 +351,12 @@ pub fn parse_regions_sv_table(
                     chr: chr_left,
                     start: pl.saturating_sub(flank).max(1),
                     end: pl.saturating_add(flank),
-                    strand: Strand::Unspecified,
                 });
                 out.push(Region {
                     name,
                     chr: chr_right,
                     start: pr.saturating_sub(flank).max(1),
                     end: pr.saturating_add(flank),
-                    strand: Strand::Unspecified,
                 });
             }
         }

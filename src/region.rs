@@ -4,15 +4,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Strand orientation for a genomic region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum Strand {
-    Forward,
-    Reverse,
-    Unspecified,
-}
-
 /// A genomic interval (1-based, inclusive on both ends).
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -20,8 +11,6 @@ pub struct Region {
     pub chr: String,
     pub start: u64,
     pub end: u64,
-    #[allow(dead_code)]
-    pub strand: Strand,
 }
 
 /// Parse comma-separated inline region strings.
@@ -93,7 +82,6 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
             chr: chr.to_string(),
             start: min(start, end),
             end: max(start, end),
-            strand: Strand::Unspecified,
         });
     }
 
@@ -117,7 +105,6 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         chr: chr.to_string(),
         start: pos.saturating_sub(effective_flank).max(1),
         end: pos.saturating_add(effective_flank),
-        strand: Strand::Unspecified,
     })
 }
 
@@ -162,6 +149,23 @@ pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
             ));
         }
         let start_1based = start_0 + 1;
+        if start_0 == end {
+            return Err(anyhow!(
+                "BED line {} has start == end ({}), which is an empty interval in \
+                 0-based half-open coordinates",
+                line_num + 1,
+                start_0
+            ));
+        }
+        if start_1based > end {
+            return Err(anyhow!(
+                "BED line {} is malformed: after converting to 1-based coordinates, \
+                 start ({}) > end ({})",
+                line_num + 1,
+                start_1based,
+                end
+            ));
+        }
         let name = if fields.len() >= 4 && !fields[3].is_empty() {
             Some(fields[3].to_string())
         } else {
@@ -172,7 +176,6 @@ pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
             chr,
             start: start_1based,
             end,
-            strand: Strand::Unspecified,
         });
     }
     Ok(regions)
@@ -378,21 +381,18 @@ mod tests {
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: Some("foo".into()),
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
@@ -410,19 +410,58 @@ mod tests {
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
         assert_eq!(removed, 0);
         assert_eq!(regions.len(), 2);
+    }
+
+    // ── sort_regions ────────────────────────────────────────────────────
+
+    // ── parse_regions_bed ──────────────────────────────────────────────
+
+    #[test]
+    fn bed_valid_region() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
+        let regions = parse_regions_bed(tmp.path()).unwrap();
+        assert_eq!(regions.len(), 1);
+        // BED 0-based half-open [100, 200) -> 1-based inclusive [101, 200]
+        assert_eq!(regions[0].start, 101);
+        assert_eq!(regions[0].end, 200);
+    }
+
+    #[test]
+    fn bed_start_equals_end_errors() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // start == end == 5 in BED means an empty interval.
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t5\t5\n").unwrap();
+        let err = parse_regions_bed(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty interval"),
+            "expected empty interval message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bed_start_greater_than_end_errors() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // start=10, end=5 in BED is malformed.
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t10\t5\n").unwrap();
+        let err = parse_regions_bed(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed"),
+            "expected malformed message, got: {msg}"
+        );
     }
 
     // ── sort_regions ────────────────────────────────────────────────────
@@ -435,28 +474,24 @@ mod tests {
                 chr: "chr10".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr2".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr1".into(),
                 start: 20,
                 end: 30,
-                strand: Strand::Unspecified,
             },
             Region {
                 name: None,
                 chr: "chr1".into(),
                 start: 1,
                 end: 10,
-                strand: Strand::Unspecified,
             },
         ];
         sort_regions(&mut regions);

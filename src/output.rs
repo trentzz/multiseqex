@@ -192,7 +192,6 @@ fn write_sv_per_file_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::region::Strand;
 
     #[test]
     fn wrap_fasta_normal() {
@@ -277,7 +276,6 @@ mod tests {
             chr: chr.to_string(),
             start,
             end,
-            strand: Strand::Unspecified,
         })
         .collect();
         let out_file = tempfile::NamedTempFile::new().unwrap();
