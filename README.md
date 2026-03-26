@@ -1,118 +1,12 @@
 # multiseqex
 
-**MULTI SEQuence EXtractor** — a fast, parallel CLI tool for extracting multiple
+**MULTI SEQuence EXtractor** — a fast, parallel CLI tool for extracting
 sequences from FASTA files using `.fai` indexing.
 
-Similar to `samtools faidx` but optimised for bulk extraction by leveraging
-multiple CPU cores and flexible batch input formats (CSV/TSV tables with named
-columns, list files, and inline regions).
-
-## Usage
-
-```text
-Usage: multiseqex [OPTIONS] <FASTA>
-
-Arguments:
-  <FASTA>  Reference FASTA file (plain text, not compressed)
-
-Options:
-      --regions <REGIONS>        Comma-separated regions: chr:start-end, ...
-      --list <LIST>              File with one region per line (chr:start-end)
-      --bed <BED>                BED file (0-based half-open; converted internally)
-      --table <TABLE>            CSV/TSV table with named columns (see below)
-      --sv-table <SV_TABLE>      CSV/TSV SV table with named columns (see below)
-      --flank <FLANK>            Flank size (applies to position-mode and BED)
-      --delimiter <DELIM>        Override delimiter for --table/--sv-table
-      --rc                       Reverse complement all extracted sequences
-      --dedup                    Remove duplicate regions before extraction
-      --sort                     Sort regions by genomic coordinate before output
-  -q, --quiet                    Suppress progress messages and warnings
-  -o, --output <OUTPUT>          Output FASTA file (default: stdout)
-      --output-dir <OUTPUT_DIR>  Output directory (one file per region/SV pair)
-      --threads <THREADS>        Number of worker threads (default: all CPUs)
-      --no-build-fai             Error if .fai is missing instead of building it
-  -h, --help                     Print help
-  -V, --version                  Print version
-```
-
-### Examples
-
-```bash
-# Single region to stdout
-multiseqex ref.fa --regions chr1:1000-2000
-
-# Multiple regions to a file
-multiseqex ref.fa --regions chr1:1000-2000,chr2:3000-4000 -o out.fa
-
-# From a CSV table (range mode)
-multiseqex ref.fa --table regions.csv -o out.fa
-
-# From a CSV table (position mode with flanking)
-multiseqex ref.fa --table positions.csv --flank 500 -o out.fa
-
-# From a BED file
-multiseqex ref.fa --bed regions.bed -o out.fa
-
-# BED with flanking (extend each region by 500bp each side)
-multiseqex ref.fa --bed regions.bed --flank 500 -o out.fa
-
-# Reverse complement all output
-multiseqex ref.fa --regions chr1:1000-2000 --rc -o out.fa
-
-# Deduplicate and sort regions
-multiseqex ref.fa --table regions.csv --dedup --sort -o out.fa
-
-# SV breakpoints to per-pair files
-multiseqex ref.fa --sv-table variants.tsv --output-dir sv_seqs/
-
-# One file per region
-multiseqex ref.fa --table regions.csv --output-dir per_region/
-
-# Combine inline regions with a table
-multiseqex ref.fa --regions chr1:1000-2000 --table extra.csv -o out.fa
-
-# Suppress progress messages
-multiseqex ref.fa --table big.csv -o out.fa --quiet
-```
-
-> **Note:** `--regions`, `--list`, and `--table` can be freely combined in a
-> single invocation. All regions from every source are merged and extracted
-> together.
-
-## Table formats
-
-Tables must have a **header row** with named columns. Column names are
-**case-insensitive** and can appear in **any order**. Extra columns (e.g. `GENE`,
-`STRAND`) are silently ignored.
-
-### `--table`
-
-| Column  | Required?                          | Description                      |
-|---------|------------------------------------|----------------------------------|
-| `CHROM` | Yes                                | Chromosome / contig name         |
-| `START` | Yes (range mode)                   | 1-based inclusive start position |
-| `END`   | Yes (range mode)                   | 1-based inclusive end position   |
-| `POS`   | Yes (position mode, needs --flank) | Single coordinate position       |
-| `NAME`  | No                                 | Region label for output naming   |
-
-- **Range mode**: provide `CHROM`, `START`, `END`.
-- **Position mode**: provide `CHROM`, `POS` and pass `--flank`.
-
-### `--sv-table`
-
-Each row produces **two regions** (left and right breakpoints).
-
-| Column        | Required?                          | Description                |
-|---------------|------------------------------------|----------------------------|
-| `CHROM_LEFT`  | Yes                                | Left breakpoint chromosome |
-| `START_LEFT`  | Yes (range mode)                   | Left breakpoint start      |
-| `END_LEFT`    | Yes (range mode)                   | Left breakpoint end        |
-| `POS_LEFT`    | Yes (position mode, needs --flank) | Left breakpoint position   |
-| `CHROM_RIGHT` | Yes                                | Right breakpoint chromosome|
-| `START_RIGHT` | Yes (range mode)                   | Right breakpoint start     |
-| `END_RIGHT`   | Yes (range mode)                   | Right breakpoint end       |
-| `POS_RIGHT`   | Yes (position mode, needs --flank) | Right breakpoint position  |
-| `NAME`        | No                                 | SV identifier for naming   |
+Similar to `samtools faidx` but built for bulk extraction. Supports multiple
+input formats (BED, VCF, GFF, CSV/TSV tables, inline regions), sequence
+transforms (reverse complement, RNA conversion, translation), masking,
+interval arithmetic, and parallel output across multiple CPU cores.
 
 ## Installation
 
@@ -139,12 +33,131 @@ cp target/release/multiseqex ~/.local/bin/
 
 ### Prerequisites
 
-- Rust 1.87+ and Cargo (edition 2024)
-- [samtools](http://www.htslib.org/doc/samtools.html) (optional — for
+- Rust 1.87+ (edition 2024)
+- [samtools](http://www.htslib.org/doc/samtools.html) (optional, for
   pre-building `.fai` indexes)
 
 If the FASTA file lacks a `.fai` index, `multiseqex` builds one automatically
 (unless `--no-build-fai` is set).
+
+## Quick start
+
+```bash
+# Single region to stdout
+multiseqex ref.fa --regions chr1:1000-2000
+
+# Multiple regions from a BED file
+multiseqex ref.fa --bed regions.bed -o out.fa
+
+# VCF variant context extraction
+multiseqex ref.fa --vcf variants.vcf --flank 100 -o out.fa
+
+# GFF gene extraction
+multiseqex ref.fa --gff annotations.gff3 --gff-feature gene -o genes.fa
+
+# Region statistics (GC%, length, masking)
+multiseqex ref.fa --bed regions.bed --stats
+
+# Translate extracted sequences to amino acids
+multiseqex ref.fa --regions chr1:1000-2000 --translate
+
+# K-mer tiling with 100bp windows, 50bp step
+multiseqex ref.fa --bed regions.bed --tile 100 --step 50 -o tiles.fa
+```
+
+## Options reference
+
+### Input formats
+
+| Flag | Description |
+|------|-------------|
+| `<FASTA>...` | One or more reference FASTA files (positional). Supports bgzip/gzip (transparent decompression). Use `-` for stdin with `--no-index`. |
+| `--regions` | Comma-separated regions: `chr:start-end`, `chr:pos+flank` |
+| `--list` | File with one region per line. Use `-` for stdin. |
+| `--bed` | BED file (0-based half-open). Supports optional name (col 4) and strand (col 6). |
+| `--table` | CSV/TSV with header. Columns: CHROM, START, END (range) or CHROM, POS (position + `--flank`). Optional: NAME, STRAND. |
+| `--sv-table` | SV paired-region table. Columns: CHROM_LEFT/RIGHT, START/END_LEFT/RIGHT or POS_LEFT/RIGHT. |
+| `--vcf` | VCF file. Extracts REF span per record. ID used as name; REF/ALT in header. |
+| `--gff` | GFF3/GTF annotation file. Use `--gff-feature` to filter (default: `gene`). |
+| `--contigs` | Comma-separated contig names to extract in full. |
+| `--contig-list` | File with one contig name per line to extract in full. |
+
+### Region manipulation
+
+| Flag | Description |
+|------|-------------|
+| `--flank` | Symmetric flank size for position-mode regions. |
+| `--flank-left` | Left-side flank (must pair with `--flank-right`). |
+| `--flank-right` | Right-side flank (must pair with `--flank-left`). |
+| `--dedup` | Remove duplicate regions (same chr, start, end). |
+| `--sort` | Sort by natural chromosome order then start position. |
+| `--merge` | Merge overlapping/book-ended regions. Implies `--sort`. |
+| `--merge-distance` | Maximum gap for merging (default: 0). Requires `--merge`. |
+| `--subtract` | BED file of intervals to subtract from input regions. |
+| `--intersect` | BED file of intervals to intersect with input regions. |
+| `--tile` | Tile each region into windows of this size (bases). |
+| `--step` | Step size for tiling (default: same as `--tile`). |
+
+### Output
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output` | Write all sequences to a single file (default: stdout). |
+| `--output-dir` | Write one file per region (or per SV pair). |
+| `--line-width` | FASTA line width (default: 60). Set to 0 to disable wrapping. |
+| `--no-wrap` | Disable FASTA line wrapping (shorthand for `--line-width 0`). |
+| `--tab-out` | TSV output: chr, start, end, name, sequence. |
+| `--fastq` | FASTQ output with constant quality character. |
+| `--qual` | Quality character for FASTQ (default: `I`, phred 40). |
+| `--stats` | Print per-region statistics (TSV) instead of sequences. |
+| `--name-template` | Custom header format. Placeholders: `{chr}`, `{start}`, `{end}`, `{name}`, `{length}`, `{index}`, `{strand}`. |
+| `--rc` | Reverse complement all extracted sequences. |
+
+### Transforms
+
+| Flag | Description |
+|------|-------------|
+| `--to-rna` | Convert T to U (DNA to RNA). |
+| `--translate` | Translate to amino acids (standard genetic code). Stop codons as `*`. |
+| `--uppercase` | Force all output bases to uppercase. |
+| `--lowercase` | Force all output bases to lowercase. |
+
+### Masking
+
+| Flag | Description |
+|------|-------------|
+| `--mask-bed` | BED file defining regions to mask within extracted sequences. |
+| `--hard-mask` | Replace masked bases with N (default when `--mask-bed` is given). |
+| `--soft-mask` | Lowercase masked bases instead of replacing with N. |
+
+### Other
+
+| Flag | Description |
+|------|-------------|
+| `--delimiter` | Override delimiter for `--table` / `--sv-table`. Accepts `tab`, `comma`, or a single character. |
+| `--threads` | Number of worker threads (default: all available CPUs). |
+| `--no-build-fai` | Error if `.fai` is missing instead of building one. |
+| `--no-index` | Scan FASTA sequentially without an FAI index. Loads into memory. Required for stdin (`-`). |
+| `-q, --quiet` | Suppress progress messages, warnings, and the progress bar. |
+
+## Feature highlights
+
+- **Multiple FASTA files**: pass several FASTA files as positional arguments.
+  Contigs are looked up across all files (each contig must appear in exactly
+  one file).
+- **Bgzip support**: bgzipped and gzipped FASTA files are decompressed
+  transparently.
+- **Progress bar**: shown on stderr when writing to a file (unless `--quiet`).
+- **Bulk-read optimisation**: nearby regions on the same contig are read in a
+  single I/O operation, reducing seek overhead.
+- **Streaming output**: stdout and single-file output buffer results in memory
+  to preserve input order while extracting in parallel.
+- **Interval arithmetic**: `--subtract` and `--intersect` apply set operations
+  against a BED file before extraction.
+- **K-mer tiling**: `--tile` and `--step` break regions into fixed-width
+  windows for downstream analysis.
+- **Coordinate systems**: inline regions and tables use 1-based inclusive
+  coordinates. BED uses 0-based half-open (converted internally).
 
 ## Documentation
 
@@ -154,6 +167,11 @@ See the [docs/](docs/) folder for detailed guides:
 - [Testing and benchmarking](docs/testing.md) — how to run tests and measure
   performance
 
-## License
+## Version
+
+Current release: **0.2.0**
+MSRV: **1.87** (Rust edition 2024)
+
+## Licence
 
 MIT
