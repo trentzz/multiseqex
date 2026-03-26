@@ -3,7 +3,7 @@
 **Epic**: PERF-001
 **Priority**: low
 **Depends on**: P001-001
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -21,7 +21,8 @@ immediately after extraction.
 
 ## Success Criteria
 
-- [ ] `--output-dir` mode writes files as they are extracted (no full collect).
-- [ ] Single-file mode either streams or documents the memory constraint.
-- [ ] All existing tests pass.
-- [ ] /update has been run after changes.
+- [x] `--output-dir` mode writes files as they are extracted (no full collect).
+- [x] Single-file/stdout mode uses ordered-slot streaming with bulk-read groups.
+- [x] Output order matches input region order (deterministic).
+- [x] All existing tests pass.
+- [x] /update has been run after changes.

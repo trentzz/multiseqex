@@ -7,7 +7,7 @@ use std::path::Path;
 /// Strand orientation for a genomic region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum Strand {
+pub enum Strand {
     Forward,
     Reverse,
     Unspecified,
@@ -15,17 +15,17 @@ pub(crate) enum Strand {
 
 /// A genomic interval (1-based, inclusive on both ends).
 #[derive(Debug, Clone)]
-pub(crate) struct Region {
-    pub(crate) name: Option<String>,
-    pub(crate) chr: String,
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+pub struct Region {
+    pub name: Option<String>,
+    pub chr: String,
+    pub start: u64,
+    pub end: u64,
     #[allow(dead_code)]
-    pub(crate) strand: Strand,
+    pub strand: Strand,
 }
 
 /// Parse comma-separated inline region strings.
-pub(crate) fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Region>> {
+pub fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Region>> {
     s.split(',')
         .filter(|t| !t.trim().is_empty())
         .map(|t| parse_region_str(t.trim(), flank))
@@ -34,7 +34,7 @@ pub(crate) fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Re
 
 /// Parse a file with one region string per line.
 /// If `path` is "-", reads from stdin instead.
-pub(crate) fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
+pub fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
     let reader: Box<dyn BufRead> = if path == Path::new("-") {
         Box::new(BufReader::new(std::io::stdin()))
     } else {
@@ -62,7 +62,7 @@ pub(crate) fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<
 }
 
 /// Parse a single region string: `chr:start-end` or `chr:pos+flank`.
-pub(crate) fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
+pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
     let (chr, rest) = s
         .split_once(':')
         .ok_or_else(|| anyhow!("Bad region (missing ':'): {}", s))?;
@@ -121,10 +121,67 @@ pub(crate) fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
     })
 }
 
+/// Parse a BED file (tab-separated: chr, start, end, optional name).
+///
+/// BED uses 0-based half-open coordinates. We convert to 1-based inclusive
+/// by adding 1 to start (end stays the same, since half-open end equals
+/// inclusive end in 1-based).
+/// Skips comment lines (starting with #) and blank lines.
+pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
+    let f =
+        File::open(path).with_context(|| format!("Cannot open BED file: {}", path.display()))?;
+    let reader = BufReader::new(f);
+    let mut regions = Vec::new();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result
+            .with_context(|| format!("I/O error reading BED file: {}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        if fields.len() < 3 {
+            return Err(anyhow!(
+                "BED line {} has fewer than 3 fields: {}",
+                line_num + 1,
+                trimmed
+            ));
+        }
+        let chr = fields[0].to_string();
+        let start_0: u64 = fields[1]
+            .parse()
+            .with_context(|| format!("Bad start at BED line {}: {}", line_num + 1, fields[1]))?;
+        let end: u64 = fields[2]
+            .parse()
+            .with_context(|| format!("Bad end at BED line {}: {}", line_num + 1, fields[2]))?;
+        if end == 0 {
+            return Err(anyhow!(
+                "BED line {} has end=0, which produces an empty region",
+                line_num + 1
+            ));
+        }
+        let start_1based = start_0 + 1;
+        let name = if fields.len() >= 4 && !fields[3].is_empty() {
+            Some(fields[3].to_string())
+        } else {
+            None
+        };
+        regions.push(Region {
+            name,
+            chr,
+            start: start_1based,
+            end,
+            strand: Strand::Unspecified,
+        });
+    }
+    Ok(regions)
+}
+
 /// Remove duplicate regions (same chr, start, end). Returns the number of duplicates removed.
 /// Preserves the first occurrence of each unique region.
 #[allow(dead_code)]
-pub(crate) fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
+pub fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
     use std::collections::HashSet;
     let original_len = regions.len();
     let mut seen = HashSet::new();
@@ -135,7 +192,7 @@ pub(crate) fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
 /// Sort regions by chromosome (natural order) then start position.
 /// Natural order means chr1, chr2, ..., chr10 rather than chr1, chr10, chr2.
 #[allow(dead_code)]
-pub(crate) fn sort_regions(regions: &mut [Region]) {
+pub fn sort_regions(regions: &mut [Region]) {
     regions.sort_by(|a, b| natural_chr_cmp(&a.chr, &b.chr).then(a.start.cmp(&b.start)));
 }
 

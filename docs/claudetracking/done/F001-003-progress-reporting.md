@@ -3,7 +3,7 @@
 **Epic**: FEAT-001
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,9 +14,9 @@ every N regions) to avoid performance overhead.
 
 ## Success Criteria
 
-- [ ] Progress messages appear on stderr for extractions with more than 100 regions.
-- [ ] Progress does not appear for small extractions (avoids noise).
-- [ ] A `--quiet` flag suppresses progress output.
-- [ ] No measurable performance regression.
-- [ ] All existing tests pass.
-- [ ] /update has been run after changes.
+- [x] Progress messages appear on stderr for extractions with more than 100 regions.
+- [x] Progress does not appear for small extractions (avoids noise).
+- [x] A `--quiet` flag suppresses progress output.
+- [x] No measurable performance regression.
+- [x] All existing tests pass.
+- [x] /update has been run after changes.

@@ -3,7 +3,7 @@
 **Epic**: FEAT-002
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,9 +14,9 @@ and warns about them on stderr.
 
 ## Success Criteria
 
-- [ ] `--dedup` flag removes regions with identical chr, start, end.
-- [ ] Duplicate count is reported on stderr.
-- [ ] Without `--dedup`, behaviour is unchanged (duplicates preserved).
-- [ ] Integration test covers deduplication.
-- [ ] All tests pass.
-- [ ] /update has been run after changes.
+- [x] `--dedup` flag removes regions with identical chr, start, end.
+- [x] Duplicate count is reported on stderr.
+- [x] Without `--dedup`, behaviour is unchanged (duplicates preserved).
+- [x] Integration test covers deduplication.
+- [x] All tests pass.
+- [x] /update has been run after changes.

@@ -3,7 +3,7 @@
 **Epic**: ARCH-001
 **Priority**: medium
 **Depends on**: A001-001
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -13,8 +13,8 @@ CLI wrapper. This enables programmatic use and cleaner testing.
 
 ## Success Criteria
 
-- [ ] `src/lib.rs` exists and exports core types and functions.
-- [ ] `src/main.rs` imports from the library and contains only CLI logic.
-- [ ] All existing tests pass.
-- [ ] `cargo doc` generates documentation for the library API.
-- [ ] `/update` has been run after changes.
+- [x] `src/lib.rs` exists and exports core types and functions.
+- [x] `src/main.rs` imports from the library and contains only CLI logic.
+- [x] All existing tests pass.
+- [x] `cargo doc` generates documentation for the library API.
+- [x] `/update` has been run after changes.

@@ -8,7 +8,7 @@ use crate::fai::FaiRecord;
 use crate::region::Region;
 
 /// Reject gzip/bgzip compressed files by checking magic bytes (0x1f 0x8b).
-pub(crate) fn detect_gzip_and_reject(fasta: &Path) -> Result<()> {
+pub fn detect_gzip_and_reject(fasta: &Path) -> Result<()> {
     let mut f =
         File::open(fasta).with_context(|| format!("Cannot open FASTA: {}", fasta.display()))?;
     let mut magic = [0u8; 2];
@@ -22,7 +22,7 @@ pub(crate) fn detect_gzip_and_reject(fasta: &Path) -> Result<()> {
 }
 
 /// Validate that all regions reference known contigs and clamp to contig bounds.
-pub(crate) fn validate_and_clamp_regions(
+pub fn validate_and_clamp_regions(
     regions: &mut [Region],
     fai: &HashMap<String, FaiRecord>,
 ) -> Result<()> {

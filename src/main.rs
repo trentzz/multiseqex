@@ -1,19 +1,14 @@
-mod extract;
-mod fai;
-mod output;
-mod region;
-mod table;
-mod validate;
-
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use std::path::PathBuf;
 
-use fai::{build_fai, check_fai_staleness, fai_path_for, read_fai};
-use output::write_sequences;
-use region::{parse_regions_inline, parse_regions_list};
-use table::{parse_regions_sv_table, parse_regions_table};
-use validate::{detect_gzip_and_reject, validate_and_clamp_regions};
+use multiseqex::fai::{build_fai, check_fai_staleness, fai_path_for, read_fai};
+use multiseqex::output::write_sequences;
+use multiseqex::region::{
+    deduplicate_regions, parse_regions_bed, parse_regions_inline, parse_regions_list, sort_regions,
+};
+use multiseqex::table::{parse_regions_sv_table, parse_regions_table};
+use multiseqex::validate::{detect_gzip_and_reject, validate_and_clamp_regions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +28,13 @@ struct Cli {
     /// File with one region per line (chr:start-end).
     #[arg(long)]
     list: Option<PathBuf>,
+
+    /// BED file (tab-separated: chr, start, end, optional name).
+    ///
+    /// BED uses 0-based half-open coordinates. They are converted to
+    /// 1-based inclusive internally (start+1, end unchanged).
+    #[arg(long, conflicts_with = "sv_table")]
+    bed: Option<PathBuf>,
 
     /// CSV/TSV table with named columns.
     ///
@@ -79,6 +81,22 @@ struct Cli {
     #[arg(long)]
     delimiter: Option<String>,
 
+    /// Reverse complement all extracted sequences.
+    #[arg(long = "rc", alias = "reverse-complement")]
+    reverse_complement: bool,
+
+    /// Deduplicate regions with identical chr, start, end before extraction.
+    #[arg(long = "dedup", alias = "deduplicate")]
+    deduplicate: bool,
+
+    /// Sort output regions by genomic coordinate (natural chromosome order, then start).
+    #[arg(long)]
+    sort: bool,
+
+    /// Suppress progress messages and warnings on stderr.
+    #[arg(short, long)]
+    quiet: bool,
+
     /// Error if .fai is missing instead of building one automatically.
     #[arg(long)]
     no_build_fai: bool,
@@ -91,6 +109,7 @@ fn main() -> Result<()> {
         && let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(t)
             .build_global()
+        && !cli.quiet
     {
         eprintln!("Warning: failed to build thread pool with {t} threads: {e}");
     }
@@ -105,12 +124,14 @@ fn main() -> Result<()> {
                 fai_path.display()
             ));
         }
-        eprintln!("Index not found. Building FAI: {}", fai_path.display());
+        if !cli.quiet {
+            eprintln!("Index not found. Building FAI: {}", fai_path.display());
+        }
         build_fai(&cli.fasta, &fai_path)?;
         fai_just_built = true;
     }
 
-    if !fai_just_built {
+    if !fai_just_built && !cli.quiet {
         check_fai_staleness(&cli.fasta, &fai_path);
     }
     let fai_index = read_fai(&fai_path)?;
@@ -120,6 +141,9 @@ fn main() -> Result<()> {
     }
     if let Some(p) = cli.list.as_ref() {
         regions.extend(parse_regions_list(p, cli.flank)?);
+    }
+    if let Some(p) = cli.bed.as_ref() {
+        regions.extend(parse_regions_bed(p)?);
     }
     if let Some(p) = cli.table.as_ref() {
         regions.extend(parse_regions_table(p, cli.flank, cli.delimiter.as_deref())?);
@@ -133,11 +157,24 @@ fn main() -> Result<()> {
     }
     if regions.is_empty() {
         return Err(anyhow!(
-            "No regions provided. Use --regions, --list, --table, or --sv-table."
+            "No regions provided. Use --regions, --list, --bed, --table, or --sv-table."
         ));
+    }
+    if cli.deduplicate {
+        let removed = deduplicate_regions(&mut regions);
+        if removed > 0 && !cli.quiet {
+            eprintln!("Deduplicated: removed {removed} duplicate region(s).");
+        }
+    }
+    if cli.sort {
+        sort_regions(&mut regions);
     }
     validate_and_clamp_regions(&mut regions, &fai_index)?;
     let is_sv = cli.sv_table.is_some();
+    let output_to_file = cli.output.is_some() || cli.output_dir.is_some();
+    if !cli.quiet && output_to_file {
+        eprintln!("Extracting {} regions from FASTA...", regions.len());
+    }
     write_sequences(
         &cli.fasta,
         &fai_index,
@@ -145,6 +182,10 @@ fn main() -> Result<()> {
         cli.output.as_deref(),
         cli.output_dir.as_deref(),
         is_sv,
+        cli.reverse_complement,
     )?;
+    if !cli.quiet && output_to_file {
+        eprintln!("Done.");
+    }
     Ok(())
 }

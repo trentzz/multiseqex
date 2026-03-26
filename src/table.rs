@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::region::Region;
 
 /// Build a case-insensitive header-name to column-index map.
-pub(crate) fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
+pub fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
     headers
         .iter()
         .enumerate()
@@ -20,7 +20,7 @@ pub(crate) fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, u
 /// Parse a user-supplied delimiter string into a byte.
 ///
 /// Accepts "tab", "comma", or a single ASCII character.
-pub(crate) fn parse_delimiter_flag(s: &str) -> Result<u8> {
+pub fn parse_delimiter_flag(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "tab" => Ok(b'\t'),
         "comma" => Ok(b','),
@@ -44,7 +44,7 @@ pub(crate) fn parse_delimiter_flag(s: &str) -> Result<u8> {
 /// 2. File extension: `.tsv` leads to tab.
 /// 3. Content sniffing: if the first line contains a tab, use tab.
 /// 4. Default to comma.
-pub(crate) fn detect_delimiter(path: &Path, cli_delimiter: Option<&str>) -> Result<u8> {
+pub fn detect_delimiter(path: &Path, cli_delimiter: Option<&str>) -> Result<u8> {
     // 1. Explicit override.
     if let Some(s) = cli_delimiter {
         return parse_delimiter_flag(s);
@@ -119,7 +119,7 @@ enum TableMode {
 }
 
 /// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME.
-pub(crate) fn parse_regions_table(
+pub fn parse_regions_table(
     path: &Path,
     flank: Option<u64>,
     cli_delimiter: Option<&str>,
@@ -238,7 +238,7 @@ enum SvMode {
 }
 
 /// Parse a CSV/TSV SV table with named columns.
-pub(crate) fn parse_regions_sv_table(
+pub fn parse_regions_sv_table(
     path: &Path,
     flank: Option<u64>,
     cli_delimiter: Option<&str>,

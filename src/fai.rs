@@ -6,26 +6,26 @@ use std::path::{Path, PathBuf};
 
 /// One record from a `.fai` index file.
 #[derive(Debug, Clone)]
-pub(crate) struct FaiRecord {
+pub struct FaiRecord {
     /// Total number of bases in this contig.
-    pub(crate) length: u64,
+    pub length: u64,
     /// Byte offset of the first base in the FASTA file.
-    pub(crate) offset: u64,
+    pub offset: u64,
     /// Number of sequence bases per line.
-    pub(crate) line_bases: u64,
+    pub line_bases: u64,
     /// Number of bytes per line (bases + newline characters).
-    pub(crate) line_bytes: u64,
+    pub line_bytes: u64,
 }
 
 /// Compute the `.fai` path for a given FASTA file.
-pub(crate) fn fai_path_for(fasta: &Path) -> PathBuf {
+pub fn fai_path_for(fasta: &Path) -> PathBuf {
     let mut s = fasta.as_os_str().to_owned();
     s.push(".fai");
     PathBuf::from(s)
 }
 
 /// Warn if the FAI file is older than the FASTA file, suggesting it may be stale.
-pub(crate) fn check_fai_staleness(fasta: &Path, fai: &Path) {
+pub fn check_fai_staleness(fasta: &Path, fai: &Path) {
     let fasta_mtime = std::fs::metadata(fasta).and_then(|m| m.modified());
     let fai_mtime = std::fs::metadata(fai).and_then(|m| m.modified());
 
@@ -42,7 +42,7 @@ pub(crate) fn check_fai_staleness(fasta: &Path, fai: &Path) {
 }
 
 /// Build a minimal `.fai` index from a FASTA file.
-pub(crate) fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
+pub fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
     let f = File::open(fasta)
         .with_context(|| format!("Cannot open FASTA for indexing: {}", fasta.display()))?;
     let mut reader = BufReader::new(f);
@@ -130,7 +130,7 @@ pub(crate) fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
 }
 
 /// Extract the first whitespace-delimited token after `>`.
-pub(crate) fn parse_fasta_header(s: &str) -> String {
+pub fn parse_fasta_header(s: &str) -> String {
     s.trim_start_matches('>')
         .split_whitespace()
         .next()
@@ -139,12 +139,12 @@ pub(crate) fn parse_fasta_header(s: &str) -> String {
 }
 
 /// Count ASCII alphabetic characters in a raw line.
-pub(crate) fn count_bases(raw: &[u8]) -> u64 {
+pub fn count_bases(raw: &[u8]) -> u64 {
     raw.iter().filter(|b| b.is_ascii_alphabetic()).count() as u64
 }
 
 /// Read a `.fai` file into a contig-name to `FaiRecord` map.
-pub(crate) fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
+pub fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
     let f =
         File::open(fai_path).with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
     let reader = BufReader::new(f);

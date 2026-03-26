@@ -3,7 +3,7 @@
 **Epic**: FEAT-001
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -13,8 +13,8 @@ like `grep ... regions.bed | multiseqex ref.fa --list -`.
 
 ## Success Criteria
 
-- [ ] `--list -` reads from stdin.
-- [ ] Integration test pipes regions through stdin.
-- [ ] Documentation updated.
-- [ ] All existing tests pass.
-- [ ] /update has been run after changes.
+- [x] `--list -` reads from stdin.
+- [x] Integration test pipes regions through stdin.
+- [x] Documentation updated.
+- [x] All existing tests pass.
+- [x] /update has been run after changes.

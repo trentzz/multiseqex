@@ -977,3 +977,103 @@ fn delimiter_invalid_value_errors() {
         .failure()
         .stderr(predicate::str::contains("Invalid --delimiter"));
 }
+
+// ─── --rc (reverse complement, F002-001) ─────────────────────────────────────
+
+#[test]
+fn rc_flag_reverses_complement() {
+    // chr1:1-10 normally extracts AAACCCGGGT.
+    // Reverse complement of AAACCCGGGT is ACCCGGGTTT.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--rc"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACCCGGGTTT"));
+}
+
+#[test]
+fn rc_flag_with_reverse_complement_alias() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--reverse-complement"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACCCGGGTTT"));
+}
+
+// ─── --dedup (deduplicate regions, F002-002) ─────────────────────────────────
+
+#[test]
+fn dedup_removes_duplicate_regions() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr1:1-10,chr2:1-10"])
+        .args(["--dedup"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header_count = stdout.lines().filter(|l| l.starts_with('>')).count();
+    assert_eq!(
+        header_count, 2,
+        "Expected 2 headers after dedup, got {header_count}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("removed 1 duplicate"),
+        "Expected dedup message on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn no_dedup_preserves_duplicates() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10,chr1:1-10"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header_count = stdout.lines().filter(|l| l.starts_with('>')).count();
+    assert_eq!(
+        header_count, 2,
+        "Without --dedup, duplicates should be preserved"
+    );
+}
+
+// ─── --sort (sorted output, F002-003) ────────────────────────────────────────
+
+#[test]
+fn sort_orders_by_natural_chromosome_then_start() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr3:1-10,chr1:11-20,chr2:1-10,chr1:1-10"])
+        .args(["--sort"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(headers.len(), 4);
+    assert_eq!(headers[0], ">chr1:1-10");
+    assert_eq!(headers[1], ">chr1:11-20");
+    assert_eq!(headers[2], ">chr2:1-10");
+    assert_eq!(headers[3], ">chr3:1-10");
+}
+
+#[test]
+fn no_sort_preserves_input_order() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr3:1-10,chr1:1-10,chr2:1-10"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with('>')).collect();
+    assert_eq!(headers.len(), 3);
+    assert_eq!(headers[0], ">chr3:1-10");
+    assert_eq!(headers[1], ">chr1:1-10");
+    assert_eq!(headers[2], ">chr2:1-10");
+}

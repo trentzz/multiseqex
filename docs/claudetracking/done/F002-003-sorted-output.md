@@ -3,7 +3,7 @@
 **Epic**: FEAT-002
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,8 +14,8 @@ names (chr1, chr2, ..., chr10 rather than chr1, chr10, chr2).
 
 ## Success Criteria
 
-- [ ] `--sort` flag sorts output by chromosome (natural order) then start.
-- [ ] Without `--sort`, output order matches input order.
-- [ ] Integration test verifies sorted output.
-- [ ] All tests pass.
-- [ ] /update has been run after changes.
+- [x] `--sort` flag sorts output by chromosome (natural order) then start.
+- [x] Without `--sort`, output order matches input order.
+- [x] Integration test verifies sorted output.
+- [x] All tests pass.
+- [x] /update has been run after changes.

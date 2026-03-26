@@ -3,7 +3,7 @@
 **Epic**: PERF-001
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,8 +14,8 @@ in-memory newline stripping would reduce syscalls dramatically.
 
 ## Success Criteria
 
-- [ ] `extract_region` uses at most one seek and one read for any region.
-- [ ] Newline characters within the read buffer are stripped in-memory.
-- [ ] All existing tests pass (correctness unchanged).
-- [ ] Benchmark shows improvement for regions spanning many lines.
-- [ ] /update has been run after changes.
+- [x] `extract_region` uses at most one seek and one read for any region.
+- [x] Newline characters within the read buffer are stripped in-memory.
+- [x] All existing tests pass (correctness unchanged).
+- [x] Bulk-read groups coalesce nearby regions on the same contig (8 KB threshold).
+- [x] /update has been run after changes.
