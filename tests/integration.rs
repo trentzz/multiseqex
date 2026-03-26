@@ -2159,3 +2159,392 @@ fn transform_to_rna_with_soft_mask() {
         .success()
         .stdout(predicate::str::contains("AAaccCGggU"));
 }
+
+// ─── Feature 2: Bgzipped FASTA support ──────────────────────────────────────
+
+#[test]
+fn bgzip_fasta_decompressed_transparently() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let gz_path = tmp.path().join("test.fa.gz");
+
+    // Compress a small FASTA to gzip format.
+    let fasta_content = b">chr1\nACGTACGTACGT\n>chr2\nTTTTGGGGCCCC\n";
+    let f = fs::File::create(&gz_path).unwrap();
+    let mut encoder = GzEncoder::new(f, Compression::default());
+    encoder.write_all(fasta_content).unwrap();
+    encoder.finish().unwrap();
+
+    // Should decompress transparently and extract.
+    cmd()
+        .arg(gz_path.to_str().unwrap())
+        .args(["--regions", "chr1:1-8"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-8"))
+        .stdout(predicate::str::contains("ACGTACGT"));
+}
+
+#[test]
+fn bgzip_fasta_with_existing_fai() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let gz_path = tmp.path().join("test.fa.gz");
+    let fai_path = tmp.path().join("test.fa.gz.fai");
+
+    let fasta_content = b">chr1\nAAAACCCCGGGGTTTT\n";
+    let f = fs::File::create(&gz_path).unwrap();
+    let mut encoder = GzEncoder::new(f, Compression::default());
+    encoder.write_all(fasta_content).unwrap();
+    encoder.finish().unwrap();
+
+    // Let the tool build a FAI from the decompressed temp.
+    cmd()
+        .arg(gz_path.to_str().unwrap())
+        .args(["--regions", "chr1:1-4"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AAAA"));
+
+    // The FAI for the original .gz path should NOT exist (it is built in temp).
+    assert!(!fai_path.exists());
+}
+
+// ─── Feature 15: Streaming extraction without FAI (--no-index) ──────────────
+
+#[test]
+fn no_index_basic_extraction() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("noindex.fa");
+    fs::write(&fasta, ">chr1\nACGTACGTACGTACGT\n>chr2\nTTTTGGGGCCCCAAAA\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-8", "--no-index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-8"))
+        .stdout(predicate::str::contains("ACGTACGT"));
+}
+
+#[test]
+fn no_index_multiple_regions() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("noindex.fa");
+    fs::write(&fasta, ">chr1\nACGTACGT\n>chr2\nTTTTGGGG\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-4,chr2:1-4", "--no-index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-4"))
+        .stdout(predicate::str::contains("ACGT"))
+        .stdout(predicate::str::contains(">chr2:1-4"))
+        .stdout(predicate::str::contains("TTTT"));
+}
+
+#[test]
+fn no_index_conflicts_with_no_build_fai() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--no-index", "--no-build-fai"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn no_index_with_rc() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("noindex.fa");
+    fs::write(&fasta, ">chr1\nAAAA\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-4", "--no-index", "--rc"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("TTTT"));
+}
+
+#[test]
+fn no_index_gzip_transparent() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let gz_path = tmp.path().join("test.fa.gz");
+
+    let fasta_content = b">chr1\nACGTACGT\n";
+    let f = fs::File::create(&gz_path).unwrap();
+    let mut encoder = GzEncoder::new(f, Compression::default());
+    encoder.write_all(fasta_content).unwrap();
+    encoder.finish().unwrap();
+
+    cmd()
+        .arg(gz_path.to_str().unwrap())
+        .args(["--regions", "chr1:1-4", "--no-index"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACGT"));
+}
+
+#[test]
+fn stdin_requires_no_index() {
+    cmd()
+        .arg("-")
+        .args(["--regions", "chr1:1-10"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --no-index"));
+}
+
+#[test]
+fn no_index_tab_output() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("noindex.fa");
+    fs::write(&fasta, ">chr1\nACGTACGT\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-4", "--no-index", "--tab-out"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("chr1\t1\t4\t.\tACGT"));
+}
+
+// ─── Feature 16: Built-in interval operations (--subtract, --intersect) ─────
+
+#[test]
+fn subtract_trims_region() {
+    let tmp = TempDir::new().unwrap();
+    let subtract_bed = tmp.path().join("subtract.bed");
+    // Subtract bases 5-7 (0-based [4,7) -> 1-based [5,7]) from chr1:1-10.
+    fs::write(&subtract_bed, "chr1\t4\t7\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--subtract",
+            subtract_bed.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        // Should produce two pieces: 1-4 and 8-10.
+        .stdout(predicate::str::contains("AAAC"))
+        .stdout(predicate::str::contains("GGT"));
+}
+
+#[test]
+fn subtract_complete_removal_errors() {
+    let tmp = TempDir::new().unwrap();
+    let subtract_bed = tmp.path().join("subtract.bed");
+    // Subtract entire region.
+    fs::write(&subtract_bed, "chr1\t0\t10000\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--subtract",
+            subtract_bed.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No regions remain after --subtract",
+        ));
+}
+
+#[test]
+fn intersect_keeps_overlap_only() {
+    let tmp = TempDir::new().unwrap();
+    let intersect_bed = tmp.path().join("intersect.bed");
+    // Keep only bases 3-6 (0-based [2,6) -> 1-based [3,6]).
+    fs::write(&intersect_bed, "chr1\t2\t6\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--intersect",
+            intersect_bed.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACCC"));
+}
+
+#[test]
+fn intersect_no_overlap_errors() {
+    let tmp = TempDir::new().unwrap();
+    let intersect_bed = tmp.path().join("intersect.bed");
+    // No overlap with chr1.
+    fs::write(&intersect_bed, "chrZ\t0\t100\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--intersect",
+            intersect_bed.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No regions remain after --intersect",
+        ));
+}
+
+#[test]
+fn intersect_then_subtract() {
+    let tmp = TempDir::new().unwrap();
+    let intersect_bed = tmp.path().join("intersect.bed");
+    let subtract_bed = tmp.path().join("subtract.bed");
+    // Intersect: keep bases 1-8 of chr1. (0-based [0,8) -> 1-based [1,8])
+    fs::write(&intersect_bed, "chr1\t0\t8\n").unwrap();
+    // Subtract: remove bases 3-5. (0-based [2,5) -> 1-based [3,5])
+    fs::write(&subtract_bed, "chr1\t2\t5\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--regions",
+            "chr1:1-10",
+            "--intersect",
+            intersect_bed.to_str().unwrap(),
+            "--subtract",
+            subtract_bed.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        // After intersect: chr1:1-8 (AAACCCGG)
+        // After subtract of [3,5]: chr1:1-2 (AA) and chr1:6-8 (CGG)
+        .stdout(predicate::str::contains("AA"))
+        .stdout(predicate::str::contains("CGG"));
+}
+
+// ─── Feature 17: K-mer tiling (--tile --step) ───────────────────────────────
+
+#[test]
+fn tile_non_overlapping() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-20", "--tile", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_tile1"))
+        .stdout(predicate::str::contains("_tile2"));
+}
+
+#[test]
+fn tile_with_step() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-20", "--tile", "10", "--step", "5"])
+        .assert()
+        .success()
+        // Should produce tiles: 1-10, 6-15, 11-20, 16-20
+        .stdout(predicate::str::contains("_tile1"))
+        .stdout(predicate::str::contains("_tile2"))
+        .stdout(predicate::str::contains("_tile3"))
+        .stdout(predicate::str::contains("_tile4"));
+}
+
+#[test]
+fn tile_zero_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--tile", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--tile must be > 0"));
+}
+
+#[test]
+fn step_requires_tile() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--step", "5"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn tile_region_shorter_than_tile() {
+    // Region of 5 bases with tile of 10: produces one tile.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-5", "--tile", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_tile1"));
+}
+
+#[test]
+fn tile_with_bed_input() {
+    let tmp = TempDir::new().unwrap();
+    let bed = tmp.path().join("tile.bed");
+    fs::write(&bed, "chr1\t0\t20\n").unwrap();
+
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--bed",
+            bed.to_str().unwrap(),
+            "--tile",
+            "10",
+            "--step",
+            "10",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_tile1"))
+        .stdout(predicate::str::contains("_tile2"));
+}
+
+#[test]
+fn tile_conflicts_with_sv_table_output_dir() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("out");
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--sv-table",
+            &fixture("sv_table_range.tsv"),
+            "--output-dir",
+            dir.to_str().unwrap(),
+            "--tile",
+            "10",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--tile cannot be used with"));
+}
+
+#[test]
+fn tile_with_no_index() {
+    let tmp = TempDir::new().unwrap();
+    let fasta = tmp.path().join("tile.fa");
+    fs::write(&fasta, ">chr1\nACGTACGTACGTACGTACGT\n").unwrap();
+
+    cmd()
+        .arg(fasta.to_str().unwrap())
+        .args(["--regions", "chr1:1-20", "--no-index", "--tile", "10"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_tile1"))
+        .stdout(predicate::str::contains("_tile2"));
+}

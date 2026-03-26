@@ -333,6 +333,44 @@ fn consume_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
     n
 }
 
+/// Tile each region into windows of `tile_size` bases with `step` stride.
+///
+/// Each tile becomes a separate output region. Tiles inherit the parent
+/// region's chromosome and strand. The name is set to the parent name (or
+/// chr:start-end) with a `_tileN` suffix.
+///
+/// The last tile may be shorter than `tile_size` if the region does not
+/// divide evenly.
+pub fn tile_regions(regions: &[Region], tile_size: u64, step: u64) -> Vec<Region> {
+    let mut tiled = Vec::new();
+
+    for r in regions {
+        let region_len = r.end - r.start + 1;
+        let base_name = r
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}-{}", r.chr, r.start, r.end));
+
+        let mut tile_idx = 0u64;
+        let mut offset = 0u64;
+        while offset < region_len {
+            let tile_start = r.start + offset;
+            let tile_end = (tile_start + tile_size - 1).min(r.end);
+            tile_idx += 1;
+            tiled.push(Region {
+                name: Some(format!("{base_name}_tile{tile_idx}")),
+                chr: r.chr.clone(),
+                start: tile_start,
+                end: tile_end,
+                strand: r.strand,
+            });
+            offset += step;
+        }
+    }
+
+    tiled
+}
+
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,5 +818,95 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start, 1);
         assert_eq!(regions[0].end, 20);
+    }
+
+    // ── tile_regions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tile_non_overlapping() {
+        let regions = vec![Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 100,
+            end: 199,
+            strand: None,
+        }];
+        let tiled = tile_regions(&regions, 50, 50);
+        assert_eq!(tiled.len(), 2);
+        assert_eq!(tiled[0].start, 100);
+        assert_eq!(tiled[0].end, 149);
+        assert_eq!(tiled[1].start, 150);
+        assert_eq!(tiled[1].end, 199);
+    }
+
+    #[test]
+    fn tile_overlapping() {
+        let regions = vec![Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 100,
+            end: 200,
+            strand: None,
+        }];
+        let tiled = tile_regions(&regions, 50, 25);
+        // Region is 101 bases (100..=200). Tiles at offsets 0,25,50,75,100:
+        // 100-149, 125-174, 150-199, 175-200, 200-200
+        assert_eq!(tiled.len(), 5, "expected 5 tiles, got {}", tiled.len());
+        assert_eq!(tiled[0].start, 100);
+        assert_eq!(tiled[0].end, 149);
+        assert_eq!(tiled[1].start, 125);
+        assert_eq!(tiled[1].end, 174);
+        assert_eq!(tiled[2].start, 150);
+        assert_eq!(tiled[2].end, 199);
+        assert_eq!(tiled[3].start, 175);
+        assert_eq!(tiled[3].end, 200);
+        assert_eq!(tiled[4].start, 200);
+        assert_eq!(tiled[4].end, 200); // Last tile is a single base.
+    }
+
+    #[test]
+    fn tile_inherits_strand() {
+        let regions = vec![Region {
+            name: Some("gene1".into()),
+            chr: "chr1".into(),
+            start: 1,
+            end: 20,
+            strand: Some('-'),
+        }];
+        let tiled = tile_regions(&regions, 10, 10);
+        assert_eq!(tiled.len(), 2);
+        assert_eq!(tiled[0].strand, Some('-'));
+        assert_eq!(tiled[1].strand, Some('-'));
+        assert!(tiled[0].name.as_ref().unwrap().contains("gene1"));
+    }
+
+    #[test]
+    fn tile_single_base_region() {
+        let regions = vec![Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 50,
+            end: 50,
+            strand: None,
+        }];
+        let tiled = tile_regions(&regions, 10, 10);
+        assert_eq!(tiled.len(), 1);
+        assert_eq!(tiled[0].start, 50);
+        assert_eq!(tiled[0].end, 50);
+    }
+
+    #[test]
+    fn tile_region_smaller_than_tile_size() {
+        let regions = vec![Region {
+            name: None,
+            chr: "chr1".into(),
+            start: 1,
+            end: 5,
+            strand: None,
+        }];
+        let tiled = tile_regions(&regions, 50, 50);
+        assert_eq!(tiled.len(), 1);
+        assert_eq!(tiled[0].start, 1);
+        assert_eq!(tiled[0].end, 5);
     }
 }
