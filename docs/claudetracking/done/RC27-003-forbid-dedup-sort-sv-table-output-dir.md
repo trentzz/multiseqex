@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: high
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -18,10 +18,10 @@ pairing-aware dedup and sort. Forbidding is the safer initial approach.
 
 ## Success Criteria
 
-- [ ] `--dedup` or `--sort` with `--sv-table --output-dir` produces a clear
+- [x] `--dedup` or `--sort` with `--sv-table --output-dir` produces a clear
       error message.
-- [ ] The combination still works if `--output-dir` is not used (flat output
+- [x] The combination still works if `--output-dir` is not used (flat output
       mode), or is also forbidden with rationale documented.
-- [ ] Tests cover the rejected combinations.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] Tests cover the rejected combinations.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

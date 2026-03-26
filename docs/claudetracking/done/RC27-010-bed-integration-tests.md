@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: low
 **Depends on**: RC27-001
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,8 +14,8 @@ base of a contig), and interaction with other flags (`--rc`, `--flank`).
 
 ## Success Criteria
 
-- [ ] At least 4 integration tests exercise `--bed` end-to-end.
-- [ ] Tests cover: basic extraction, extra columns, edge coordinates, and
+- [x] At least 4 integration tests exercise `--bed` end-to-end.
+- [x] Tests cover: basic extraction, extra columns, edge coordinates, and
       flag interaction.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

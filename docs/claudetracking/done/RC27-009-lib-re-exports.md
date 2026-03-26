@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,9 +14,9 @@ without knowing the module layout.
 
 ## Success Criteria
 
-- [ ] Common types (e.g. `Region`, `Fai`, key parse/extract functions) are
+- [x] Common types (e.g. `Region`, `Fai`, key parse/extract functions) are
       re-exported from the crate root.
-- [ ] Existing module paths still work (re-exports are additive).
-- [ ] Doc-tests or examples use the short import paths.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] Existing module paths still work (re-exports are additive).
+- [x] Doc-tests or examples use the short import paths.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

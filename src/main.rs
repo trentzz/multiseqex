@@ -165,7 +165,7 @@ fn main() -> Result<()> {
         regions.extend(parse_regions_list(p, cli.flank)?);
     }
     if let Some(p) = cli.bed.as_ref() {
-        regions.extend(parse_regions_bed(p)?);
+        regions.extend(parse_regions_bed(p, cli.flank)?);
     }
     if let Some(p) = cli.table.as_ref() {
         regions.extend(parse_regions_table(p, cli.flank, cli.delimiter.as_deref())?);

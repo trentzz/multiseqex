@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: high
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -15,10 +15,10 @@ depending on what makes sense for extraction.
 
 ## Success Criteria
 
-- [ ] BED lines with `start > end` produce a clear error and stop parsing.
-- [ ] BED lines with `start == end` are handled explicitly (skipped with
+- [x] BED lines with `start > end` produce a clear error and stop parsing.
+- [x] BED lines with `start == end` are handled explicitly (skipped with
       warning or rejected with error).
-- [ ] Existing valid BED files still parse correctly.
-- [ ] Unit tests cover both the `start > end` and `start == end` cases.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] Existing valid BED files still parse correctly.
+- [x] Unit tests cover both the `start > end` and `start == end` cases.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

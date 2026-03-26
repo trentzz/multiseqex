@@ -114,7 +114,7 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
 /// by adding 1 to start (end stays the same, since half-open end equals
 /// inclusive end in 1-based).
 /// Skips comment lines (starting with #) and blank lines.
-pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
+pub fn parse_regions_bed(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
     let f =
         File::open(path).with_context(|| format!("Cannot open BED file: {}", path.display()))?;
     let reader = BufReader::new(f);
@@ -171,11 +171,17 @@ pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
         } else {
             None
         };
+        // Apply flanking after the 0-based to 1-based conversion.
+        let (final_start, final_end) = if let Some(f) = flank {
+            (start_1based.saturating_sub(f).max(1), end.saturating_add(f))
+        } else {
+            (start_1based, end)
+        };
         regions.push(Region {
             name,
             chr,
-            start: start_1based,
-            end,
+            start: final_start,
+            end: final_end,
         });
     }
     Ok(regions)
@@ -183,7 +189,6 @@ pub fn parse_regions_bed(path: &Path) -> Result<Vec<Region>> {
 
 /// Remove duplicate regions (same chr, start, end). Returns the number of duplicates removed.
 /// Preserves the first occurrence of each unique region.
-#[allow(dead_code)]
 pub fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
     use std::collections::HashSet;
     let original_len = regions.len();
@@ -194,7 +199,6 @@ pub fn deduplicate_regions(regions: &mut Vec<Region>) -> usize {
 
 /// Sort regions by chromosome (natural order) then start position.
 /// Natural order means chr1, chr2, ..., chr10 rather than chr1, chr10, chr2.
-#[allow(dead_code)]
 pub fn sort_regions(regions: &mut [Region]) {
     regions.sort_by(|a, b| natural_chr_cmp(&a.chr, &b.chr).then(a.start.cmp(&b.start)));
 }
@@ -233,6 +237,10 @@ fn natural_chr_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// Consume consecutive digits from a peekable char iterator and return as u64.
+/// Uses saturating arithmetic, so very long numeric strings clamp to `u64::MAX`
+/// instead of wrapping. This is acceptable because chromosome names with numbers
+/// exceeding `u64::MAX` are not realistic, and saturation preserves a stable
+/// sort order.
 fn consume_number(it: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
     let mut n: u64 = 0;
     while let Some(&c) = it.peek() {
@@ -431,7 +439,7 @@ mod tests {
     fn bed_valid_region() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
-        let regions = parse_regions_bed(tmp.path()).unwrap();
+        let regions = parse_regions_bed(tmp.path(), None).unwrap();
         assert_eq!(regions.len(), 1);
         // BED 0-based half-open [100, 200) -> 1-based inclusive [101, 200]
         assert_eq!(regions[0].start, 101);
@@ -443,7 +451,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // start == end == 5 in BED means an empty interval.
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t5\t5\n").unwrap();
-        let err = parse_regions_bed(tmp.path()).unwrap_err();
+        let err = parse_regions_bed(tmp.path(), None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("empty interval"),
@@ -456,12 +464,36 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // start=10, end=5 in BED is malformed.
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t10\t5\n").unwrap();
-        let err = parse_regions_bed(tmp.path()).unwrap_err();
+        let err = parse_regions_bed(tmp.path(), None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("malformed"),
             "expected malformed message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn bed_with_flanking() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // BED: chr1 100 200 (0-based half-open) -> 1-based [101, 200]
+        // With flank=50: start = 101 - 50 = 51, end = 200 + 50 = 250
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t100\t200\n").unwrap();
+        let regions = parse_regions_bed(tmp.path(), Some(50)).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 51);
+        assert_eq!(regions[0].end, 250);
+    }
+
+    #[test]
+    fn bed_with_flanking_clamps_start_to_one() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // BED: chr1 0 10 -> 1-based [1, 10]
+        // With flank=5: start = max(1 - 5, 1) = 1, end = 10 + 5 = 15
+        std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t0\t10\n").unwrap();
+        let regions = parse_regions_bed(tmp.path(), Some(5)).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[0].end, 15);
     }
 
     // ── sort_regions ────────────────────────────────────────────────────

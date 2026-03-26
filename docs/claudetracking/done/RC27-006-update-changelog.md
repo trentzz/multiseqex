@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -13,10 +13,10 @@ changelog format.
 
 ## Success Criteria
 
-- [ ] CHANGELOG.md has an `[Unreleased]` or `[0.2.0]` section.
-- [ ] All new features are listed (BED input, reverse complement, dedup,
+- [x] CHANGELOG.md has an `[Unreleased]` or `[0.2.0]` section.
+- [x] All new features are listed (BED input, reverse complement, dedup,
       sort, quiet mode, delimiter).
-- [ ] All bug fixes and breaking changes are listed.
-- [ ] Format is consistent with the existing v0.1.0 entry.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] All bug fixes and breaking changes are listed.
+- [x] Format is consistent with the existing v0.1.0 entry.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

@@ -18,9 +18,15 @@ Arguments:
 Options:
       --regions <REGIONS>        Comma-separated regions: chr:start-end, ...
       --list <LIST>              File with one region per line (chr:start-end)
+      --bed <BED>                BED file (0-based half-open; converted internally)
       --table <TABLE>            CSV/TSV table with named columns (see below)
       --sv-table <SV_TABLE>      CSV/TSV SV table with named columns (see below)
-      --flank <FLANK>            Flank size for position-mode tables
+      --flank <FLANK>            Flank size (applies to position-mode and BED)
+      --delimiter <DELIM>        Override delimiter for --table/--sv-table
+      --rc                       Reverse complement all extracted sequences
+      --dedup                    Remove duplicate regions before extraction
+      --sort                     Sort regions by genomic coordinate before output
+  -q, --quiet                    Suppress progress messages and warnings
   -o, --output <OUTPUT>          Output FASTA file (default: stdout)
       --output-dir <OUTPUT_DIR>  Output directory (one file per region/SV pair)
       --threads <THREADS>        Number of worker threads (default: all CPUs)
@@ -44,6 +50,18 @@ multiseqex ref.fa --table regions.csv -o out.fa
 # From a CSV table (position mode with flanking)
 multiseqex ref.fa --table positions.csv --flank 500 -o out.fa
 
+# From a BED file
+multiseqex ref.fa --bed regions.bed -o out.fa
+
+# BED with flanking (extend each region by 500bp each side)
+multiseqex ref.fa --bed regions.bed --flank 500 -o out.fa
+
+# Reverse complement all output
+multiseqex ref.fa --regions chr1:1000-2000 --rc -o out.fa
+
+# Deduplicate and sort regions
+multiseqex ref.fa --table regions.csv --dedup --sort -o out.fa
+
 # SV breakpoints to per-pair files
 multiseqex ref.fa --sv-table variants.tsv --output-dir sv_seqs/
 
@@ -52,6 +70,9 @@ multiseqex ref.fa --table regions.csv --output-dir per_region/
 
 # Combine inline regions with a table
 multiseqex ref.fa --regions chr1:1000-2000 --table extra.csv -o out.fa
+
+# Suppress progress messages
+multiseqex ref.fa --table big.csv -o out.fa --quiet
 ```
 
 > **Note:** `--regions`, `--list`, and `--table` can be freely combined in a

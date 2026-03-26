@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -14,9 +14,9 @@ where helpful.
 
 ## Success Criteria
 
-- [ ] README.md documents all v0.2.0 flags with brief descriptions.
-- [ ] docs/usage.md documents all v0.2.0 flags with examples.
-- [ ] Flag descriptions match the actual CLI help text.
-- [ ] No stale references to removed or renamed flags.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] README.md documents all v0.2.0 flags with brief descriptions.
+- [x] docs/usage.md documents all v0.2.0 flags with examples.
+- [x] Flag descriptions match the actual CLI help text.
+- [x] No stale references to removed or renamed flags.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

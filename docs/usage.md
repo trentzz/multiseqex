@@ -92,6 +92,31 @@ chr1:1000-2000`) and is used for filenames with `--output-dir` (e.g.
 silently ignored.
 Column names are **case-insensitive** and can appear in any order.
 
+### BED file (`--bed`)
+
+A standard BED file (tab-separated). BED uses 0-based half-open coordinates.
+They are converted to 1-based inclusive internally (start+1, end unchanged).
+An optional fourth column provides a region name.
+
+```bed
+chr1	1000	2000
+chr2	3000	4000	myregion
+```
+
+```bash
+multiseqex ref.fa --bed regions.bed -o out.fa
+```
+
+Comments (lines starting with `#`) and blank lines are skipped.
+
+The `--flank` flag extends each BED region symmetrically. Flanking is applied
+after the coordinate conversion:
+
+```bash
+# Extend each region by 500bp on each side
+multiseqex ref.fa --bed regions.bed --flank 500 -o out.fa
+```
+
 ### SV table (`--sv-table`)
 
 For structural variants, each row produces **two regions** (left and right
@@ -151,6 +176,63 @@ multiseqex ref.fa --regions chr1:1-500 --list regions.txt --table extra.csv -o o
 When using `--output-dir` with `--sv-table`, each SV pair is written to one
 file containing both breakpoint sequences.
 
+## Reverse complement (`--rc`)
+
+The `--rc` flag reverse-complements every extracted sequence before output.
+All IUPAC ambiguity codes are supported.
+
+```bash
+multiseqex ref.fa --regions chr1:1000-2000 --rc -o out.fa
+```
+
+## Deduplication (`--dedup`)
+
+The `--dedup` flag removes duplicate regions (same chromosome, start, end)
+before extraction. The first occurrence of each region is kept. A message is
+printed to stderr reporting how many duplicates were removed (unless `--quiet`
+is set).
+
+```bash
+multiseqex ref.fa --table regions.csv --dedup -o out.fa
+```
+
+## Sorting (`--sort`)
+
+The `--sort` flag sorts regions by chromosome (natural order: chr1, chr2, ...,
+chr10) then by start position. This applies before extraction, so the output
+follows sorted order.
+
+```bash
+multiseqex ref.fa --table regions.csv --sort -o out.fa
+```
+
+`--dedup` and `--sort` can be combined. Deduplication runs first.
+
+## Quiet mode (`--quiet`)
+
+The `-q` / `--quiet` flag suppresses all progress messages and warnings on
+stderr. Error messages still appear.
+
+```bash
+multiseqex ref.fa --table big.csv -o out.fa --quiet
+```
+
+## Delimiter override (`--delimiter`)
+
+By default, `--table` and `--sv-table` auto-detect the delimiter. Files with a
+`.tsv` extension use tab. Other files are sniffed for tabs in the header line,
+falling back to comma.
+
+Use `--delimiter` to override:
+
+```bash
+multiseqex ref.fa --table data.txt --delimiter tab
+multiseqex ref.fa --table data.txt --delimiter comma
+multiseqex ref.fa --table data.txt --delimiter ";"
+```
+
+`--delimiter` requires `--table` or `--sv-table`.
+
 ## FAI index
 
 `multiseqex` requires a `.fai` index alongside the FASTA file. If one is not
@@ -170,3 +252,12 @@ By default all available CPU cores are used. Override with `--threads`:
 ```bash
 multiseqex ref.fa --table big_table.csv --threads 4
 ```
+
+## Performance notes
+
+When writing to stdout or a single output file (`-o`), all extracted sequences
+are buffered in memory to preserve input order. Memory usage therefore scales
+with the total output size (number of regions multiplied by average region
+length). For very large extraction jobs where memory is a concern, use
+`--output-dir` instead. Each region is written independently in that mode,
+keeping memory usage proportional to a single region at a time.

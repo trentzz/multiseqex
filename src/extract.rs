@@ -232,46 +232,52 @@ mod tests {
 
 /// Reverse complement a DNA sequence, supporting all IUPAC ambiguity codes.
 ///
-/// Complements each base according to IUPAC rules, then reverses the string.
-/// Unrecognised characters are left unchanged.
-#[allow(dead_code)]
+/// Iterates the input as bytes in reverse order, complements each base
+/// according to IUPAC rules, and collects to a `Vec<u8>` before converting
+/// back to a `String`. This avoids per-character UTF-8 decoding overhead.
+/// Unrecognised bytes are left unchanged.
 pub fn reverse_complement(seq: &str) -> String {
-    seq.chars()
+    let out: Vec<u8> = seq
+        .as_bytes()
+        .iter()
         .rev()
-        .map(|c| match c {
-            'A' => 'T',
-            'T' => 'A',
-            'C' => 'G',
-            'G' => 'C',
-            'R' => 'Y',
-            'Y' => 'R',
-            'S' => 'S',
-            'W' => 'W',
-            'K' => 'M',
-            'M' => 'K',
-            'B' => 'V',
-            'V' => 'B',
-            'D' => 'H',
-            'H' => 'D',
-            'N' => 'N',
-            'a' => 't',
-            't' => 'a',
-            'c' => 'g',
-            'g' => 'c',
-            'r' => 'y',
-            'y' => 'r',
-            's' => 's',
-            'w' => 'w',
-            'k' => 'm',
-            'm' => 'k',
-            'b' => 'v',
-            'v' => 'b',
-            'd' => 'h',
-            'h' => 'd',
-            'n' => 'n',
+        .map(|&b| match b {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'R' => b'Y',
+            b'Y' => b'R',
+            b'S' => b'S',
+            b'W' => b'W',
+            b'K' => b'M',
+            b'M' => b'K',
+            b'B' => b'V',
+            b'V' => b'B',
+            b'D' => b'H',
+            b'H' => b'D',
+            b'N' => b'N',
+            b'a' => b't',
+            b't' => b'a',
+            b'c' => b'g',
+            b'g' => b'c',
+            b'r' => b'y',
+            b'y' => b'r',
+            b's' => b's',
+            b'w' => b'w',
+            b'k' => b'm',
+            b'm' => b'k',
+            b'b' => b'v',
+            b'v' => b'b',
+            b'd' => b'h',
+            b'h' => b'd',
+            b'n' => b'n',
             other => other,
         })
-        .collect()
+        .collect();
+    // Safety: the input is valid UTF-8 and our mapping preserves ASCII,
+    // so the output is always valid UTF-8.
+    String::from_utf8(out).expect("reverse_complement produced invalid UTF-8")
 }
 
 #[cfg(test)]

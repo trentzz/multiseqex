@@ -83,6 +83,13 @@ pub fn write_sequences(
     Ok(())
 }
 
+/// Extract regions in parallel and write them to a single destination
+/// (stdout or a file) while preserving the original input order.
+///
+/// All formatted FASTA entries are buffered in memory before writing, so
+/// memory usage scales with total output size rather than with the number
+/// of regions alone. For very large extraction jobs where memory is a
+/// concern, prefer `--output-dir` which streams each region independently.
 fn write_streaming_ordered(
     fasta_path: &Path,
     fai_index: &HashMap<String, FaiRecord>,

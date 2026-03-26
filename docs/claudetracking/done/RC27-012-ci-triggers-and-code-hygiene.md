@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -19,9 +19,9 @@ Address three low-priority housekeeping items:
 
 ## Success Criteria
 
-- [ ] No `#[allow(dead_code)]` annotations remain (items either have
+- [x] No `#[allow(dead_code)]` annotations remain (items either have
       doc-tests or are genuinely removed).
-- [ ] Natural sort has a comment explaining the overflow edge case.
-- [ ] CI workflow triggers on `release/**` branches.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] Natural sort has a comment explaining the overflow edge case.
+- [x] CI workflow triggers on `release/**` branches.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

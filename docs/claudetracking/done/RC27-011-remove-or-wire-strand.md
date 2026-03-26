@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: low
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -16,11 +16,11 @@ Removing is simpler. Wiring up is more useful but larger in scope.
 
 ## Success Criteria
 
-- [ ] `Strand` is either removed or fully integrated into BED parsing and
+- [x] `Strand` is either removed or fully integrated into BED parsing and
       extraction.
-- [ ] No `#[allow(dead_code)]` annotations remain for strand-related code.
-- [ ] If wired up: minus-strand BED regions are automatically reverse
+- [x] No `#[allow(dead_code)]` annotations remain for strand-related code.
+- [x] If wired up: minus-strand BED regions are automatically reverse
       complemented.
-- [ ] If removed: no references to `Strand` remain in the codebase.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] If removed: no references to `Strand` remain in the codebase.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

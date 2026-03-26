@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: medium
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -15,9 +15,9 @@ on large sequences.
 
 ## Success Criteria
 
-- [ ] `reverse_complement` operates on bytes, not chars.
-- [ ] Output is identical to the previous implementation for all valid bases.
-- [ ] Invalid bytes are handled the same way as before (or better).
-- [ ] Unit tests confirm correctness for standard and ambiguous IUPAC bases.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] `reverse_complement` operates on bytes, not chars.
+- [x] Output is identical to the previous implementation for all valid bases.
+- [x] Invalid bytes are handled the same way as before (or better).
+- [x] Unit tests confirm correctness for standard and ambiguous IUPAC bases.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

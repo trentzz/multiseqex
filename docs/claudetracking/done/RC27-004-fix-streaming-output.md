@@ -3,7 +3,7 @@
 **Epic**: REVIEW-CYCLE-2026-03-27
 **Priority**: high
 **Depends on**: none
-**Status**: todo
+**Status**: done
 
 ## Goal
 
@@ -19,10 +19,10 @@ memory requirements for large jobs.
 
 ## Success Criteria
 
-- [ ] Output is written incrementally as sequences are extracted, or the
+- [x] Output is written incrementally as sequences are extracted, or the
       limitation is documented in CLI help and usage docs.
-- [ ] Memory usage does not grow proportionally to the number of regions
+- [x] Memory usage does not grow proportionally to the number of regions
       (verified by inspection or a simple test).
-- [ ] Existing output is byte-identical before and after the change.
-- [ ] All tests pass.
-- [ ] `/update` has been run after changes.
+- [x] Existing output is byte-identical before and after the change.
+- [x] All tests pass.
+- [x] `/update` has been run after changes.

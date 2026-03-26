@@ -1077,3 +1077,68 @@ fn no_sort_preserves_input_order() {
     assert_eq!(headers[1], ">chr1:1-10");
     assert_eq!(headers[2], ">chr2:1-10");
 }
+
+// ─── BED input (RC27-010) ────────────────────────────────────────────────────
+
+#[test]
+fn bed_3_column_basic() {
+    // BED 0-based [0,10) -> 1-based [1,10]
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions.bed")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains("AAACCCGGGT"))
+        .stdout(predicate::str::contains(">chr2:1-10"))
+        .stdout(predicate::str::contains("TTTTTTTTTT"))
+        .stdout(predicate::str::contains(">chr3:1-10"))
+        .stdout(predicate::str::contains("ATCGATCGAT"));
+}
+
+#[test]
+fn bed_with_name_column() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions_named.bed")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">geneA chr1:1-10"))
+        .stdout(predicate::str::contains(">geneB chr2:1-10"));
+}
+
+#[test]
+fn bed_with_flank() {
+    // BED: chr1 0 10 -> 1-based [1,10]. With --flank 5: [1, 15]
+    // (start = max(1-5, 1) = 1, end = 10+5 = 15)
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions.bed"), "--flank", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-15"))
+        .stdout(predicate::str::contains(">chr2:1-15"))
+        .stdout(predicate::str::contains(">chr3:1-15"));
+}
+
+#[test]
+fn bed_with_rc() {
+    // chr1:1-10 = AAACCCGGGT, RC = ACCCGGGTTT
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions.bed"), "--rc"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ACCCGGGTTT"));
+}
+
+#[test]
+fn bed_with_comments_and_blanks() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--bed", &fixture("regions_comments.bed")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(">chr1:1-10"))
+        .stdout(predicate::str::contains(">chr2:1-10"));
+}
