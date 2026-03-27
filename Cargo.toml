@@ -1,7 +1,8 @@
 [package]
 name = "multiseqex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.87"
 authors = ["Trent Zeng <dev@trentz.me>"]
 license = "MIT"
 description = "Multi-sequence extractor from FASTA using FAI indexing, with parallelism and flexible region input formats."
@@ -11,16 +12,20 @@ documentation = "https://docs.rs/multiseqex"
 readme = "README.md"
 keywords = ["bioinformatics", "fasta", "faidx", "sequence", "parallel"]
 categories = ["science", "command-line-utilities"]
-exclude = ["docs/", "tests/fixtures/"]
+exclude = ["docs/", "tests/", ".claude/", ".github/"]
 
 [dependencies]
 anyhow = "1.0.99"
 clap = { version = "4.5.45", features = ["derive"] }
 csv = "1.3.1"
+flate2 = "1"
+indicatif = "0.17"
 rayon = "1.11.0"
+tempfile = "3"
 
 [dev-dependencies]
 assert_cmd = "2"
+flate2 = "1"
 predicates = "3"
 tempfile = "3"
 

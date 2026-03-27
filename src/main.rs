@@ -1,38 +1,21 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Parser;
-use rayon::prelude::*;
-use std::cell::RefCell;
-use std::cmp::{max, min};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-// ─── Data types ──────────────────────────────────────────────────────────────
-
-/// A genomic interval (1-based, inclusive on both ends).
-#[derive(Debug, Clone)]
-struct Region {
-    name: Option<String>,
-    chr: String,
-    start: u64,
-    end: u64,
-}
-
-/// One record from a `.fai` index file.
-#[derive(Debug, Clone)]
-struct FaiRecord {
-    /// Total number of bases in this contig.
-    length: u64,
-    /// Byte offset of the first base in the FASTA file.
-    offset: u64,
-    /// Number of sequence bases per line.
-    line_bases: u64,
-    /// Number of bytes per line (bases + newline characters).
-    line_bytes: u64,
-}
-
-// ─── CLI definition ──────────────────────────────────────────────────────────
+use multiseqex::fai::{build_fai, check_fai_staleness, fai_path_for, read_fai};
+use multiseqex::gff::parse_regions_gff;
+use multiseqex::intervals::{intersect_regions, subtract_regions};
+use multiseqex::mask::MaskIndex;
+use multiseqex::output::{OutputConfig, write_sequences};
+use multiseqex::region::{
+    deduplicate_regions, merge_regions, parse_regions_bed, parse_regions_inline,
+    parse_regions_list, resolve_flanks, sort_regions, tile_regions,
+};
+use multiseqex::stats::write_stats;
+use multiseqex::table::{parse_regions_sv_table, parse_regions_table};
+use multiseqex::transform::TransformConfig;
+use multiseqex::validate::{resolve_bgzip, validate_and_clamp_regions};
+use multiseqex::vcf::parse_regions_vcf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,8 +25,12 @@ struct FaiRecord {
     about = "Multi-sequence extractor for FASTA using FAI"
 )]
 struct Cli {
-    /// Reference FASTA file (plain text, not compressed).
-    fasta: PathBuf,
+    /// Reference FASTA file(s). Supports plain text and bgzip/gzip compressed
+    /// files (decompressed transparently). Use `-` for stdin (requires --no-index).
+    /// When multiple files are given, contigs are looked up across all files.
+    /// A contig must appear in exactly one file.
+    #[arg(required = true)]
+    fasta: Vec<PathBuf>,
 
     /// Comma-separated regions: chr:start-end, chr2:start-end, ...
     #[arg(long)]
@@ -53,13 +40,21 @@ struct Cli {
     #[arg(long)]
     list: Option<PathBuf>,
 
+    /// BED file (tab-separated: chr, start, end, optional name).
+    ///
+    /// BED uses 0-based half-open coordinates. They are converted to
+    /// 1-based inclusive internally (start+1, end unchanged).
+    #[arg(long, conflicts_with = "sv_table")]
+    bed: Option<PathBuf>,
+
     /// CSV/TSV table with named columns.
     ///
     /// Required: CHROM.
     /// Range mode: CHROM, START, END.
     /// Position mode: CHROM, POS (requires --flank).
-    /// Optional: NAME.
-    /// Extra columns are ignored. Delimiter auto-detected (.tsv → tab, else comma).
+    /// Optional: NAME, STRAND.
+    /// Extra columns are ignored. Delimiter auto-detected (.tsv -> tab, else sniff
+    /// for tabs, else comma). Use --delimiter to override.
     #[arg(long)]
     table: Option<PathBuf>,
 
@@ -68,33 +63,187 @@ struct Cli {
     /// Required: CHROM_LEFT, CHROM_RIGHT.
     /// Range mode: START_LEFT, END_LEFT, START_RIGHT, END_RIGHT.
     /// Position mode: POS_LEFT, POS_RIGHT (requires --flank).
-    /// Optional: NAME.
+    /// Optional: NAME, STRAND.
     /// Extra columns are ignored.
-    #[arg(long, conflicts_with_all = ["regions", "table", "list"])]
+    #[arg(long, conflicts_with_all = ["regions", "table", "list", "contigs", "contig_list", "vcf", "gff"])]
     sv_table: Option<PathBuf>,
 
-    /// Flank size for position-mode tables (required with POS columns).
-    #[arg(long)]
+    /// VCF file. Each record produces a region spanning POS to POS+len(REF)-1.
+    /// The ID field is used as the region name (unless "."). REF and ALT are
+    /// included in the FASTA header description.
+    #[arg(long, conflicts_with = "sv_table")]
+    vcf: Option<PathBuf>,
+
+    /// GFF3/GTF annotation file. Extracts regions for features matching
+    /// --gff-feature (default: "gene").
+    #[arg(long, conflicts_with = "sv_table")]
+    gff: Option<PathBuf>,
+
+    /// Feature type to filter when using --gff (default: "gene").
+    #[arg(long, default_value = "gene", requires = "gff")]
+    gff_feature: String,
+
+    /// Flank size for position-mode regions (POS columns in tables and
+    /// pos+flank inline syntax). Has no effect on BED or range-format regions.
+    #[arg(long, conflicts_with_all = ["flank_left", "flank_right"])]
     flank: Option<u64>,
+
+    /// Left-side flank size. Overrides --flank on the left side.
+    #[arg(long)]
+    flank_left: Option<u64>,
+
+    /// Right-side flank size. Overrides --flank on the right side.
+    #[arg(long)]
+    flank_right: Option<u64>,
+
+    /// Comma-separated contig names to extract in full.
+    #[arg(long, conflicts_with = "sv_table")]
+    contigs: Option<String>,
+
+    /// File with one contig name per line to extract in full.
+    #[arg(long, conflicts_with = "sv_table")]
+    contig_list: Option<PathBuf>,
 
     /// Output FASTA file (single combined file; default: stdout).
     #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
 
     /// Output directory, one FASTA file per region (or per SV pair).
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, conflicts_with_all = ["output", "tab_out"])]
     output_dir: Option<PathBuf>,
 
     /// Number of worker threads (default: all available CPUs).
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Override delimiter for --table / --sv-table.
+    ///
+    /// Accepts "tab", "comma", or a single character (e.g. ";").
+    /// When omitted the delimiter is auto-detected: .tsv -> tab,
+    /// otherwise the first line is sniffed for tabs, falling back to comma.
+    #[arg(long)]
+    delimiter: Option<String>,
+
+    /// Reverse complement all extracted sequences.
+    #[arg(long = "rc", alias = "reverse-complement")]
+    reverse_complement: bool,
+
+    /// Deduplicate regions with identical chr, start, end before extraction.
+    #[arg(long = "dedup", alias = "deduplicate")]
+    deduplicate: bool,
+
+    /// Sort output regions by genomic coordinate (natural chromosome order, then start).
+    #[arg(long)]
+    sort: bool,
+
+    /// Suppress progress messages, warnings, and the progress bar on stderr.
+    #[arg(short, long)]
+    quiet: bool,
+
     /// Error if .fai is missing instead of building one automatically.
     #[arg(long)]
     no_build_fai: bool,
-}
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
+    /// FASTA line width (default 60). Set to 0 to disable wrapping.
+    #[arg(long, default_value = "60", conflicts_with = "no_wrap")]
+    line_width: usize,
+
+    /// Disable FASTA line wrapping (shorthand for --line-width 0).
+    #[arg(long, conflicts_with = "line_width")]
+    no_wrap: bool,
+
+    /// Emit TSV output instead of FASTA (columns: chr, start, end, name, sequence).
+    #[arg(long, conflicts_with_all = ["output_dir", "fastq"])]
+    tab_out: bool,
+
+    /// Merge overlapping or book-ended regions on the same chromosome.
+    /// Implies --sort.
+    #[arg(long)]
+    merge: bool,
+
+    /// Maximum distance between regions to merge (default 0). Requires --merge.
+    #[arg(long, default_value = "0")]
+    merge_distance: u64,
+
+    /// Emit FASTQ output instead of FASTA. Uses a constant quality character
+    /// (default 'I', phred 40). See --qual.
+    #[arg(long, conflicts_with_all = ["tab_out"])]
+    fastq: bool,
+
+    /// Quality character for FASTQ output (default 'I', phred 40).
+    /// Must be a single ASCII character.
+    #[arg(long, default_value = "I", requires = "fastq")]
+    qual: String,
+
+    /// Print per-region statistics (TSV) instead of extracting sequences.
+    /// Columns: chr, start, end, name, length, gc_percent, n_count, masked_count.
+    #[arg(long, conflicts_with_all = ["output", "output_dir", "fastq", "tab_out", "reverse_complement"])]
+    stats: bool,
+
+    /// Template for FASTA/FASTQ header names. Placeholders: {chr}, {start},
+    /// {end}, {name}, {length}, {index}, {strand}.
+    #[arg(long, conflicts_with_all = ["tab_out", "stats"])]
+    name_template: Option<String>,
+
+    // ── Masking flags ──────────────────────────────────────────────────
+    /// BED file defining regions to mask within extracted sequences.
+    #[arg(long)]
+    mask_bed: Option<PathBuf>,
+
+    /// Replace masked bases with N (default when --mask-bed is given).
+    #[arg(long, requires = "mask_bed", conflicts_with = "soft_mask")]
+    hard_mask: bool,
+
+    /// Lowercase masked bases instead of replacing with N.
+    #[arg(long, requires = "mask_bed", conflicts_with = "hard_mask")]
+    soft_mask: bool,
+
+    // ── Transform flags ────────────────────────────────────────────────
+    /// Convert T to U in output sequences (DNA to RNA).
+    #[arg(long, conflicts_with = "translate")]
+    to_rna: bool,
+
+    /// Translate to amino acids (standard genetic code, reading frame from
+    /// position 1). Stop codons are represented as *.
+    #[arg(long, conflicts_with = "to_rna")]
+    translate: bool,
+
+    /// Force all output bases to uppercase.
+    #[arg(long, conflicts_with = "lowercase")]
+    uppercase: bool,
+
+    /// Force all output bases to lowercase.
+    #[arg(long, conflicts_with = "uppercase")]
+    lowercase: bool,
+
+    // ── No-index / streaming mode ─────────────────────────────────────
+    /// Scan the FASTA sequentially without requiring an FAI index. Loads
+    /// the entire FASTA into memory. Allows `-` as the FASTA path for
+    /// stdin. Conflicts with --no-build-fai.
+    #[arg(long, conflicts_with = "no_build_fai")]
+    no_index: bool,
+
+    // ── Interval operations ───────────────────────────────────────────
+    /// BED file of intervals to subtract from input regions. Removes
+    /// overlapping portions, potentially splitting regions.
+    #[arg(long)]
+    subtract: Option<PathBuf>,
+
+    /// BED file of intervals to intersect with input regions. Keeps only
+    /// overlapping portions.
+    #[arg(long)]
+    intersect: Option<PathBuf>,
+
+    // ── K-mer tiling ──────────────────────────────────────────────────
+    /// Tile each region into windows of this size (in bases).
+    #[arg(long)]
+    tile: Option<u64>,
+
+    /// Step size for tiling (default: same as --tile, i.e. non-overlapping).
+    /// Requires --tile.
+    #[arg(long, requires = "tile")]
+    step: Option<u64>,
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -103,1022 +252,529 @@ fn main() -> Result<()> {
         && let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(t)
             .build_global()
+        && !cli.quiet
     {
         eprintln!("Warning: failed to build thread pool with {t} threads: {e}");
     }
 
-    // Reject compressed (gzip/bgzip) input.
-    detect_gzip_and_reject(&cli.fasta)?;
-
-    // Ensure .fai exists (or build it).
-    let fai_path = fai_path_for(&cli.fasta);
-    if !fai_path.exists() {
-        if cli.no_build_fai {
-            return Err(anyhow!(
-                "Missing index: {} (use samtools faidx or remove --no-build-fai)",
-                fai_path.display()
-            ));
-        }
-        eprintln!("Index not found. Building FAI: {}", fai_path.display());
-        build_fai(&cli.fasta, &fai_path)?;
+    // --delimiter only makes sense with --table or --sv-table.
+    if cli.delimiter.is_some() && cli.table.is_none() && cli.sv_table.is_none() {
+        return Err(anyhow!("--delimiter requires --table or --sv-table"));
     }
-    let fai_index = read_fai(&fai_path)?;
 
-    // Collect regions from all input sources.
-    let mut regions = Vec::<Region>::new();
+    // --flank-left/--flank-right must be given together.
+    if cli.flank_left.is_some() != cli.flank_right.is_some() {
+        return Err(anyhow!(
+            "--flank-left and --flank-right must be specified together"
+        ));
+    }
+
+    // --merge-distance requires --merge.
+    if cli.merge_distance > 0 && !cli.merge {
+        return Err(anyhow!("--merge-distance requires --merge"));
+    }
+
+    // --merge conflicts with --sv-table --output-dir.
+    if cli.merge && cli.sv_table.is_some() && cli.output_dir.is_some() {
+        return Err(anyhow!(
+            "--merge cannot be used with --sv-table --output-dir because it breaks \
+             the paired region invariant"
+        ));
+    }
+
+    // --dedup/--sort with --sv-table --output-dir would break paired region
+    // ordering. Forbid this combination.
+    if (cli.deduplicate || cli.sort) && cli.sv_table.is_some() && cli.output_dir.is_some() {
+        let flag = if cli.deduplicate && cli.sort {
+            "--dedup and --sort"
+        } else if cli.deduplicate {
+            "--dedup"
+        } else {
+            "--sort"
+        };
+        return Err(anyhow!(
+            "{flag} cannot be used with --sv-table --output-dir because they break \
+             the paired region invariant (pairs may be deduplicated or reordered)"
+        ));
+    }
+
+    // Validate --qual is a single ASCII character.
+    if cli.qual.len() != 1 || !cli.qual.is_ascii() {
+        return Err(anyhow!(
+            "--qual must be a single ASCII character, got '{}'",
+            cli.qual
+        ));
+    }
+
+    // --to-rna and --translate conflict with --stats.
+    if (cli.to_rna || cli.translate) && cli.stats {
+        return Err(anyhow!(
+            "--to-rna and --translate cannot be used with --stats"
+        ));
+    }
+
+    // --tile must be > 0.
+    if let Some(tile) = cli.tile {
+        if tile == 0 {
+            return Err(anyhow!("--tile must be > 0"));
+        }
+    }
+
+    // --step must be > 0.
+    if let Some(step) = cli.step {
+        if step == 0 {
+            return Err(anyhow!("--step must be > 0"));
+        }
+    }
+
+    // --tile conflicts with --sv-table --output-dir (breaks pairing).
+    if cli.tile.is_some() && cli.sv_table.is_some() && cli.output_dir.is_some() {
+        return Err(anyhow!(
+            "--tile cannot be used with --sv-table --output-dir because it breaks \
+             the paired region invariant"
+        ));
+    }
+
+    // --no-index requires exactly one FASTA file.
+    if cli.no_index && cli.fasta.len() > 1 {
+        return Err(anyhow!(
+            "--no-index supports only a single FASTA file (or stdin via '-')"
+        ));
+    }
+
+    // Build mask index if --mask-bed is given.
+    let mask_index = if let Some(ref mask_path) = cli.mask_bed {
+        Some(MaskIndex::from_bed(mask_path)?)
+    } else {
+        None
+    };
+
+    let mask_mode = if cli.soft_mask {
+        multiseqex::mask::MaskMode::Soft
+    } else {
+        // Default to hard mask when --mask-bed is given.
+        multiseqex::mask::MaskMode::Hard
+    };
+
+    // Build transform config.
+    let transform = TransformConfig {
+        to_rna: cli.to_rna,
+        uppercase: cli.uppercase,
+        lowercase: cli.lowercase,
+        translate: cli.translate,
+    };
+
+    // ── Load FASTA files and build combined index ──────────────────────
+
+    // Validate all FASTA files and build/load their FAI indices.
+    // Bgzip/gzip files are decompressed to temporary files transparently.
+    let mut fasta_paths: Vec<PathBuf> = Vec::with_capacity(cli.fasta.len());
+    let mut fai_indices = Vec::new();
+    // Keep temp directories alive for the duration of the programme.
+    let mut _bgzip_temps: Vec<tempfile::TempDir> = Vec::new();
+    // In-memory sequences for --no-index mode.
+    let mut noindex_sequences: Option<std::collections::HashMap<String, Vec<u8>>> = None;
+
+    let is_stdin = cli.fasta.len() == 1 && cli.fasta[0] == std::path::Path::new("-");
+
+    if cli.no_index {
+        // --no-index: load the FASTA into memory without an FAI index.
+        if !cli.quiet {
+            if is_stdin {
+                eprintln!("Reading FASTA from stdin (--no-index mode, loading into memory).");
+            } else {
+                eprintln!(
+                    "Loading FASTA into memory (--no-index mode): {}",
+                    cli.fasta[0].display()
+                );
+            }
+        }
+        let reader: Box<dyn std::io::Read> = if is_stdin {
+            Box::new(std::io::stdin())
+        } else {
+            let fasta_path = &cli.fasta[0];
+            if multiseqex::validate::is_gzip(fasta_path)? {
+                let f = std::fs::File::open(fasta_path)?;
+                Box::new(flate2::read::GzDecoder::new(f))
+            } else {
+                Box::new(std::fs::File::open(fasta_path)?)
+            }
+        };
+        let (seqs, fai) = multiseqex::noindex::load_fasta_into_memory(reader)?;
+        // We still need a dummy fasta_paths entry for the output pipeline.
+        // In no-index mode, we write output directly and do not use the file-based
+        // extraction pipeline, so a placeholder suffices.
+        fasta_paths.push(if is_stdin {
+            PathBuf::from("-")
+        } else {
+            cli.fasta[0].clone()
+        });
+        fai_indices.push(fai);
+        noindex_sequences = Some(seqs);
+    } else {
+        if is_stdin {
+            return Err(anyhow!("Reading from stdin ('-') requires --no-index"));
+        }
+        for fasta_path in &cli.fasta {
+            let (resolved_path, tmp_dir) = resolve_bgzip(fasta_path, cli.quiet)?;
+            if let Some(td) = tmp_dir {
+                _bgzip_temps.push(td);
+            }
+            let fai_path = fai_path_for(fasta_path);
+            // For bgzip files, try the FAI next to the original file first.
+            // If not found, also try next to the decompressed temp file.
+            let effective_fai = if fai_path.exists() {
+                fai_path.clone()
+            } else {
+                fai_path_for(&resolved_path)
+            };
+            let mut fai_just_built = false;
+            if !effective_fai.exists() {
+                if cli.no_build_fai {
+                    return Err(anyhow!(
+                        "Missing index: {} (use samtools faidx or remove --no-build-fai)",
+                        fai_path.display()
+                    ));
+                }
+                if !cli.quiet {
+                    eprintln!("Index not found. Building FAI: {}", effective_fai.display());
+                }
+                build_fai(&resolved_path, &effective_fai)?;
+                fai_just_built = true;
+            }
+
+            if !fai_just_built && !cli.quiet {
+                check_fai_staleness(&resolved_path, &effective_fai);
+            }
+            let idx = read_fai(&effective_fai)?;
+            fasta_paths.push(resolved_path);
+            fai_indices.push(idx);
+        }
+    }
+
+    // Build the combined FAI index. Maps contig name to (fasta_file_index, FaiRecord).
+    // Error if a contig appears in multiple FASTA files.
+    let mut combined_fai = std::collections::HashMap::new();
+    let mut contig_to_fasta: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (file_idx, idx) in fai_indices.iter().enumerate() {
+        for (name, rec) in idx {
+            if let Some(prev_idx) = contig_to_fasta.get(name) {
+                return Err(anyhow!(
+                    "Contig '{}' appears in multiple FASTA files: '{}' and '{}'",
+                    name,
+                    fasta_paths[*prev_idx].display(),
+                    fasta_paths[file_idx].display()
+                ));
+            }
+            contig_to_fasta.insert(name.clone(), file_idx);
+            combined_fai.insert(name.clone(), rec.clone());
+        }
+    }
+
+    let fai_index = combined_fai;
+
+    let mut regions = Vec::new();
+    let mut vcf_descriptions: Vec<String> = Vec::new();
+
     if let Some(s) = cli.regions.as_deref() {
         regions.extend(parse_regions_inline(s, cli.flank)?);
     }
     if let Some(p) = cli.list.as_ref() {
         regions.extend(parse_regions_list(p, cli.flank)?);
     }
+    if let Some(p) = cli.bed.as_ref() {
+        regions.extend(parse_regions_bed(
+            p,
+            cli.flank,
+            cli.flank_left,
+            cli.flank_right,
+        )?);
+    }
     if let Some(p) = cli.table.as_ref() {
-        regions.extend(parse_regions_table(p, cli.flank)?);
+        regions.extend(parse_regions_table(
+            p,
+            cli.flank,
+            cli.flank_left,
+            cli.flank_right,
+            cli.delimiter.as_deref(),
+        )?);
     }
     if let Some(p) = cli.sv_table.as_ref() {
-        regions.extend(parse_regions_sv_table(p, cli.flank)?);
+        regions.extend(parse_regions_sv_table(
+            p,
+            cli.flank,
+            cli.flank_left,
+            cli.flank_right,
+            cli.delimiter.as_deref(),
+        )?);
+    }
+
+    // --vcf: extract regions from VCF records.
+    if let Some(p) = cli.vcf.as_ref() {
+        let vcf_results = parse_regions_vcf(p, cli.flank, cli.flank_left, cli.flank_right)?;
+        let base_idx = regions.len();
+        for (region, rec) in vcf_results {
+            regions.push(region);
+            // Pad vcf_descriptions to align with region indices.
+            while vcf_descriptions.len() < base_idx {
+                vcf_descriptions.push(String::new());
+            }
+            vcf_descriptions.push(multiseqex::vcf::vcf_description(&rec));
+        }
+    }
+
+    // --gff: extract regions from GFF3/GTF annotation.
+    if let Some(p) = cli.gff.as_ref() {
+        let gff_regions = parse_regions_gff(p, &cli.gff_feature)?;
+        // Apply flanking to GFF regions if specified.
+        let has_flank =
+            cli.flank.is_some() || cli.flank_left.is_some() || cli.flank_right.is_some();
+        if has_flank {
+            let (fl, fr) = resolve_flanks(cli.flank, cli.flank_left, cli.flank_right);
+            for mut r in gff_regions {
+                r.start = r.start.saturating_sub(fl).max(1);
+                r.end = r.end.saturating_add(fr);
+                regions.push(r);
+            }
+        } else {
+            regions.extend(gff_regions);
+        }
+    }
+
+    // --contigs: extract whole contigs by name.
+    if let Some(contig_str) = cli.contigs.as_deref() {
+        for name in contig_str.split(',').filter(|s| !s.trim().is_empty()) {
+            let name = name.trim();
+            let rec = fai_index
+                .get(name)
+                .ok_or_else(|| anyhow!("Contig '{}' not found in FAI index", name))?;
+            regions.push(multiseqex::region::Region {
+                name: None,
+                chr: name.to_string(),
+                start: 1,
+                end: rec.length,
+                strand: None,
+            });
+        }
+    }
+
+    // --contig-list: extract whole contigs from a file (one per line).
+    if let Some(p) = cli.contig_list.as_ref() {
+        let content = std::fs::read_to_string(p)
+            .map_err(|e| anyhow!("Cannot read contig list file '{}': {}", p.display(), e))?;
+        for line in content.lines() {
+            let name = line.trim();
+            if name.is_empty() || name.starts_with('#') {
+                continue;
+            }
+            let rec = fai_index
+                .get(name)
+                .ok_or_else(|| anyhow!("Contig '{}' not found in FAI index", name))?;
+            regions.push(multiseqex::region::Region {
+                name: None,
+                chr: name.to_string(),
+                start: 1,
+                end: rec.length,
+                strand: None,
+            });
+        }
     }
 
     if regions.is_empty() {
         return Err(anyhow!(
-            "No regions provided. Use --regions, --list, --table, or --sv-table."
+            "No regions provided. Use --regions, --list, --bed, --table, --sv-table, \
+             --vcf, --gff, --contigs, or --contig-list."
         ));
     }
 
-    // Validate and clamp regions to contig lengths.
+    // ── Interval operations (before dedup/sort/merge) ────────────────
+    // Intersect first, then subtract (as specified).
+    if let Some(ref bed_path) = cli.intersect {
+        regions = intersect_regions(&regions, bed_path)?;
+        if regions.is_empty() {
+            return Err(anyhow!(
+                "No regions remain after --intersect. All input regions were outside \
+                 the intervals in '{}'.",
+                bed_path.display()
+            ));
+        }
+        if !cli.quiet {
+            eprintln!("After --intersect: {} region(s) remain.", regions.len());
+        }
+    }
+    if let Some(ref bed_path) = cli.subtract {
+        regions = subtract_regions(&regions, bed_path)?;
+        if regions.is_empty() {
+            return Err(anyhow!(
+                "No regions remain after --subtract. All input regions were fully \
+                 covered by intervals in '{}'.",
+                bed_path.display()
+            ));
+        }
+        if !cli.quiet {
+            eprintln!("After --subtract: {} region(s) remain.", regions.len());
+        }
+    }
+
+    // ── K-mer tiling ─────────────────────────────────────────────────
+    if let Some(tile_size) = cli.tile {
+        let step = cli.step.unwrap_or(tile_size);
+        let before = regions.len();
+        regions = tile_regions(&regions, tile_size, step);
+        if !cli.quiet {
+            eprintln!(
+                "Tiled {before} region(s) into {} tiles (tile={tile_size}, step={step}).",
+                regions.len()
+            );
+        }
+    }
+
+    if cli.deduplicate {
+        let removed = deduplicate_regions(&mut regions);
+        if removed > 0 && !cli.quiet {
+            eprintln!("Deduplicated: removed {removed} duplicate region(s).");
+        }
+    }
+
+    // --merge implies --sort.
+    if cli.merge {
+        let before = regions.len();
+        merge_regions(&mut regions, cli.merge_distance);
+        let after = regions.len();
+        if before != after && !cli.quiet {
+            eprintln!(
+                "Merged: {before} regions into {after} ({} merged).",
+                before - after
+            );
+        }
+    } else if cli.sort {
+        sort_regions(&mut regions);
+    }
+
     validate_and_clamp_regions(&mut regions, &fai_index)?;
 
+    // --stats: print statistics table and exit.
+    if cli.stats {
+        if noindex_sequences.is_some() {
+            return Err(anyhow!("--stats is not supported with --no-index"));
+        }
+        write_stats(&fasta_paths, &fai_index, &contig_to_fasta, &regions)?;
+        return Ok(());
+    }
+
+    let effective_line_width = if cli.no_wrap { 0 } else { cli.line_width };
+
+    let config = OutputConfig {
+        fastq: cli.fastq,
+        qual_char: cli.qual.chars().next().unwrap_or('I'),
+        name_template: cli.name_template,
+        vcf_descriptions,
+        mask_index,
+        mask_mode,
+        transform,
+    };
+
     let is_sv = cli.sv_table.is_some();
+    let output_to_file = cli.output.is_some() || cli.output_dir.is_some();
+
+    // Show progress bar on stderr when writing to a file and not quiet.
+    let show_progress = !cli.quiet && output_to_file;
+
+    // ── --no-index extraction path ───────────────────────────────────
+    if let Some(ref sequences) = noindex_sequences {
+        use multiseqex::extract::reverse_complement;
+        use multiseqex::noindex::extract_region_from_memory;
+        use multiseqex::output::wrap_fasta;
+
+        if show_progress {
+            eprintln!("Extracting {} regions (--no-index mode)...", regions.len());
+        }
+        let mut writer: Box<dyn std::io::Write> = match cli.output.as_deref() {
+            Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
+            None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+        };
+        for (i, r) in regions.iter().enumerate() {
+            let mut seq = extract_region_from_memory(sequences, r)?;
+            // Apply strand and RC.
+            let strand_rc = r.strand == Some('-');
+            if strand_rc ^ cli.reverse_complement {
+                seq = reverse_complement(&seq);
+            }
+            // Apply masking and transforms.
+            if let Some(ref mask_idx) = config.mask_index {
+                seq = mask_idx.apply(&seq, &r.chr, r.start, r.end, config.mask_mode);
+            }
+            if config.transform.any_active() {
+                seq = config.transform.apply(&seq);
+            }
+            // Format output.
+            if cli.tab_out {
+                let name = r.name.as_deref().unwrap_or(".");
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{}",
+                    r.chr, r.start, r.end, name, seq
+                )?;
+            } else if config.fastq {
+                let qual: String = std::iter::repeat_n(config.qual_char, seq.len()).collect();
+                let header = format_header(r, i, &config);
+                write!(writer, "@{header}\n{seq}\n+\n{qual}\n")?;
+            } else {
+                let header = format_header(r, i, &config);
+                write!(
+                    writer,
+                    ">{header}\n{}\n",
+                    wrap_fasta(&seq, effective_line_width)
+                )?;
+            }
+        }
+        use std::io::Write as _;
+        writer.flush()?;
+        if show_progress {
+            eprintln!("Done.");
+        }
+        return Ok(());
+    }
+
+    // ── Standard FAI-based extraction path ───────────────────────────
+    if show_progress {
+        eprintln!("Extracting {} regions from FASTA...", regions.len());
+    }
     write_sequences(
-        &cli.fasta,
+        &fasta_paths,
         &fai_index,
+        &contig_to_fasta,
         &regions,
         cli.output.as_deref(),
         cli.output_dir.as_deref(),
         is_sv,
+        cli.reverse_complement,
+        effective_line_width,
+        cli.tab_out,
+        &config,
+        show_progress,
     )?;
-
-    Ok(())
-}
-
-// ─── Input validation ────────────────────────────────────────────────────────
-
-/// Reject gzip/bgzip compressed files by checking magic bytes (0x1f 0x8b).
-fn detect_gzip_and_reject(fasta: &Path) -> Result<()> {
-    let mut f =
-        File::open(fasta).with_context(|| format!("Cannot open FASTA: {}", fasta.display()))?;
-    let mut magic = [0u8; 2];
-    if f.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b] {
-        return Err(anyhow!(
-            "File appears to be gzip/bgzip compressed: {}. Decompress it first (e.g. gunzip or bgzip -d).",
-            fasta.display()
-        ));
+    if show_progress {
+        eprintln!("Done.");
     }
     Ok(())
 }
 
-// ─── FAI helpers ─────────────────────────────────────────────────────────────
-
-/// Compute the `.fai` path for a given FASTA file.
-fn fai_path_for(fasta: &Path) -> PathBuf {
-    let mut s = fasta.as_os_str().to_owned();
-    s.push(".fai");
-    PathBuf::from(s)
-}
-
-/// Build a minimal `.fai` index from a FASTA file.
-fn build_fai(fasta: &Path, fai_out: &Path) -> Result<()> {
-    let f = File::open(fasta)
-        .with_context(|| format!("Cannot open FASTA for indexing: {}", fasta.display()))?;
-    let mut reader = BufReader::new(f);
-    let mut out = BufWriter::new(
-        File::create(fai_out)
-            .with_context(|| format!("Cannot create FAI: {}", fai_out.display()))?,
-    );
-
-    let mut pos: u64 = 0;
-    let mut line = String::new();
-
-    let mut current_name: Option<String> = None;
-    let mut seq_offset: u64 = 0;
-    let mut seq_len: u64 = 0;
-    let mut line_bases: u64 = 0;
-    let mut line_bytes: u64 = 0;
-    let mut first_seq_line = true;
-
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            // EOF — flush last contig.
-            if let Some(name) = current_name.take() {
-                writeln!(
-                    out,
-                    "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}"
-                )?;
-            }
-            break;
-        }
-
-        let raw = line.as_bytes();
-        let linelen = raw.len() as u64;
-
-        if raw.starts_with(b">") {
-            // New contig header — flush the previous one.
-            if let Some(name) = current_name.replace(parse_fasta_header(&line)) {
-                writeln!(
-                    out,
-                    "{name}\t{seq_len}\t{seq_offset}\t{line_bases}\t{line_bytes}"
-                )?;
-            }
-            seq_offset = pos + linelen;
-            seq_len = 0;
-            line_bases = 0;
-            line_bytes = 0;
-            first_seq_line = true;
-        } else {
-            let bases = count_bases(raw);
-            seq_len += bases;
-            if first_seq_line {
-                line_bases = bases;
-                line_bytes = linelen;
-                first_seq_line = false;
-            } else if bases > 0 && bases != line_bases && linelen != line_bytes {
-                // Non-final lines with a different width indicate an inconsistent FASTA.
-                // Only warn if this is not the last (possibly shorter) line of the contig.
-                // We cannot know for certain it is non-final here, so we check that
-                // the line is shorter than expected (final lines are allowed to differ).
-                if linelen >= line_bytes {
-                    eprintln!(
-                        "Warning: inconsistent line width in contig '{}': expected {} bases/{} bytes, got {} bases/{} bytes",
-                        current_name.as_deref().unwrap_or("?"),
-                        line_bases,
-                        line_bytes,
-                        bases,
-                        linelen
-                    );
-                }
-            }
-        }
-        pos += linelen;
-    }
-
-    out.flush()?;
-    Ok(())
-}
-
-/// Extract the first whitespace-delimited token after `>`.
-fn parse_fasta_header(s: &str) -> String {
-    s.trim_start_matches('>')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Count ASCII alphabetic characters in a raw line.
-fn count_bases(raw: &[u8]) -> u64 {
-    raw.iter().filter(|b| b.is_ascii_alphabetic()).count() as u64
-}
-
-/// Read a `.fai` file into a contig-name → `FaiRecord` map.
-fn read_fai(fai_path: &Path) -> Result<HashMap<String, FaiRecord>> {
-    let f =
-        File::open(fai_path).with_context(|| format!("Cannot open FAI: {}", fai_path.display()))?;
-    let reader = BufReader::new(f);
-    let mut map = HashMap::new();
-
-    for (i, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 5 {
-            return Err(anyhow!("Malformed FAI line {}: {}", i + 1, line));
-        }
-        map.insert(
-            parts[0].to_string(),
-            FaiRecord {
-                length: parts[1]
-                    .parse()
-                    .with_context(|| format!("Bad length, FAI line {}", i + 1))?,
-                offset: parts[2]
-                    .parse()
-                    .with_context(|| format!("Bad offset, FAI line {}", i + 1))?,
-                line_bases: parts[3]
-                    .parse()
-                    .with_context(|| format!("Bad line_bases, FAI line {}", i + 1))?,
-                line_bytes: parts[4]
-                    .parse()
-                    .with_context(|| format!("Bad line_bytes, FAI line {}", i + 1))?,
-            },
-        );
-    }
-    Ok(map)
-}
-
-// ─── Sequence extraction ─────────────────────────────────────────────────────
-
-/// Extract a region from a FASTA file using the FAI index.
-/// Accepts a mutable file handle to allow reuse across calls on the same thread.
-fn extract_region(f: &mut File, fai: &HashMap<String, FaiRecord>, r: &Region) -> Result<String> {
-    let rec = fai
-        .get(&r.chr)
-        .ok_or_else(|| anyhow!("Contig '{}' not in index", r.chr))?;
-
-    if rec.line_bases == 0 {
-        return Err(anyhow!(
-            "Malformed FAI: line_bases is 0 for contig '{}' (would cause division by zero)",
-            r.chr
-        ));
-    }
-
-    let lb = rec.line_bases;
-    let lby = rec.line_bytes;
-
-    let mut seq = Vec::<u8>::with_capacity((r.end - r.start + 1) as usize);
-    let mut pos = r.start;
-
-    while pos <= r.end {
-        let line_idx = (pos - 1) / lb;
-        let in_line_offset = (pos - 1) % lb;
-        let run = min(lb - in_line_offset, r.end - pos + 1);
-        let byte_pos = rec.offset + line_idx * lby + in_line_offset;
-
-        f.seek(SeekFrom::Start(byte_pos))?;
-        let mut buf = vec![0u8; run as usize];
-        f.read_exact(&mut buf)?;
-        seq.extend_from_slice(&buf);
-
-        pos += run;
-    }
-
-    // Normalise to uppercase.
-    for b in &mut seq {
-        b.make_ascii_uppercase();
-    }
-    Ok(String::from_utf8(seq)?)
-}
-
-// ─── Region parsing: inline & list ───────────────────────────────────────────
-
-/// Parse comma-separated inline region strings.
-fn parse_regions_inline(s: &str, flank: Option<u64>) -> Result<Vec<Region>> {
-    s.split(',')
-        .filter(|t| !t.trim().is_empty())
-        .map(|t| parse_region_str(t.trim(), flank))
-        .collect()
-}
-
-/// Parse a file with one region string per line.
-fn parse_regions_list(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let f =
-        File::open(path).with_context(|| format!("Cannot open list file: {}", path.display()))?;
-    BufReader::new(f)
-        .lines()
-        .map(|l| l.with_context(|| format!("I/O error reading list file: {}", path.display())))
-        .filter_map(|l| match l {
-            Err(e) => Some(Err(e)),
-            Ok(line) => {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    None
-                } else {
-                    Some(Ok(trimmed))
-                }
-            }
-        })
-        .map(|l| l.and_then(|l| parse_region_str(&l, flank)))
-        .collect()
-}
-
-/// Parse a single region string: `chr:start-end` or `chr:pos+flank`.
-fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
-    let (chr, rest) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow!("Bad region (missing ':'): {}", s))?;
-
-    // chr:start-end
-    if let Some((start_s, end_s)) = rest.split_once('-') {
-        let start: u64 = start_s
-            .replace(',', "")
-            .parse()
-            .with_context(|| format!("Bad start in region: {s}"))?;
-        let end: u64 = end_s
-            .replace(',', "")
-            .parse()
-            .with_context(|| format!("Bad end in region: {s}"))?;
-        return Ok(Region {
-            name: None,
-            chr: chr.to_string(),
-            start: min(start, end),
-            end: max(start, end),
-        });
-    }
-
-    // chr:pos+flank
-    let (pos_s, flank_s) = rest
-        .split_once('+')
-        .ok_or_else(|| anyhow!("Bad region format (expected start-end or pos+flank): {s}"))?;
-
-    let pos: u64 = pos_s
-        .replace(',', "")
-        .parse()
-        .with_context(|| format!("Bad position in region: {s}"))?;
-    let inline_flank: u64 = flank_s
-        .replace(',', "")
-        .parse()
-        .with_context(|| format!("Bad flank in region: {s}"))?;
-    let effective_flank = inline_flank.max(flank.unwrap_or(0));
-
-    Ok(Region {
-        name: None,
-        chr: chr.to_string(),
-        start: pos.saturating_sub(effective_flank).max(1),
-        end: pos.saturating_add(effective_flank),
-    })
-}
-
-// ─── Region parsing: CSV/TSV tables ──────────────────────────────────────────
-
-/// Build a case-insensitive header-name → column-index map.
-fn build_header_map(headers: &csv::StringRecord) -> HashMap<String, usize> {
-    headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.trim().to_uppercase(), i))
-        .collect()
-}
-
-/// Auto-detect CSV/TSV delimiter from file extension.
-fn detect_delimiter(path: &Path) -> u8 {
-    let is_tsv = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("tsv"));
-    if is_tsv { b'\t' } else { b',' }
-}
-
-/// Parse a numeric field from a CSV record, with a contextual error message.
-fn parse_u64_field(
-    rec: &csv::StringRecord,
-    col_idx: usize,
-    field_name: &str,
-    row: usize,
-) -> Result<u64> {
-    rec.get(col_idx)
-        .ok_or_else(|| anyhow!("Missing {field_name} at row {row}"))?
-        .trim()
-        .replace(',', "")
-        .parse()
-        .with_context(|| format!("Bad {field_name} at row {row}"))
-}
-
-/// Look up a required column by name, returning a helpful error if absent.
-fn require_column(
-    hmap: &HashMap<String, usize>,
-    name: &str,
-    headers: &csv::StringRecord,
-) -> Result<usize> {
-    hmap.get(name)
-        .copied()
-        .ok_or_else(|| anyhow!("Table missing required {name} column (found: {headers:?})"))
-}
-
-/// Read a string field from a CSV record.
-fn read_string_field(rec: &csv::StringRecord, col_idx: usize) -> Result<String> {
-    Ok(rec.get(col_idx).unwrap_or("").trim().to_string())
-}
-
-/// Read an optional NAME field (returns `None` if the column is absent or empty).
-fn read_optional_name(rec: &csv::StringRecord, name_idx: Option<usize>) -> Option<String> {
-    name_idx.and_then(|idx| {
-        rec.get(idx)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
-}
-
-enum TableMode {
-    Range { start_idx: usize, end_idx: usize },
-    Position { pos_idx: usize },
-}
-
-/// Parse a CSV/TSV table with named columns: CHROM, START, END, POS, NAME.
-fn parse_regions_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = detect_delimiter(path);
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .delimiter(delim)
-        .from_path(path)
-        .with_context(|| format!("Cannot open table: {}", path.display()))?;
-
-    let headers = rdr.headers()?.clone();
-    let hmap = build_header_map(&headers);
-
-    let chrom_idx = require_column(&hmap, "CHROM", &headers)?;
-    let name_idx = hmap.get("NAME").copied();
-
-    let has_start = hmap.get("START").copied();
-    let has_end = hmap.get("END").copied();
-    let has_pos = hmap.get("POS").copied();
-
-    let mode = match (has_start, has_end, has_pos) {
-        (Some(s), Some(e), None) => TableMode::Range {
-            start_idx: s,
-            end_idx: e,
-        },
-        (None, None, Some(p)) => TableMode::Position { pos_idx: p },
-        (Some(_), Some(_), Some(_)) => {
-            return Err(anyhow!(
-                "Table has both START/END and POS columns — ambiguous. \
-                 Use either START+END (range) or POS (position)."
-            ));
-        }
-        (Some(_), None, _) | (None, Some(_), _) => {
-            return Err(anyhow!(
-                "Table has only one of START/END — both are required for range mode (found: {headers:?})"
-            ));
-        }
-        _ => {
-            return Err(anyhow!(
-                "Table must have START+END or POS columns (found: {headers:?})"
-            ));
-        }
-    };
-
-    if matches!(mode, TableMode::Position { .. }) && flank.is_none() {
-        return Err(anyhow!(
-            "--flank is required when table uses POS column (position mode)"
-        ));
-    }
-    let flank = flank.unwrap_or(0);
-
-    let mut out = Vec::new();
-    for (i, rec) in rdr.records().enumerate() {
-        let rec = rec?;
-        let row = i + 2;
-        let chr = read_string_field(&rec, chrom_idx)?;
-        let name = read_optional_name(&rec, name_idx);
-
-        let region = match &mode {
-            TableMode::Range { start_idx, end_idx } => {
-                let s = parse_u64_field(&rec, *start_idx, "START", row)?;
-                let e = parse_u64_field(&rec, *end_idx, "END", row)?;
-                Region {
-                    name,
-                    chr,
-                    start: min(s, e),
-                    end: max(s, e),
-                }
-            }
-            TableMode::Position { pos_idx } => {
-                let p = parse_u64_field(&rec, *pos_idx, "POS", row)?;
-                Region {
-                    name,
-                    chr,
-                    start: p.saturating_sub(flank).max(1),
-                    end: p.saturating_add(flank),
-                }
-            }
+/// Format a FASTA/FASTQ header for a region.
+fn format_header(r: &multiseqex::region::Region, index: usize, config: &OutputConfig) -> String {
+    if let Some(ref template) = config.name_template {
+        multiseqex::template::expand_template(template, r, index + 1)
+    } else {
+        let suffix = match r.strand {
+            Some('+') => "(+)",
+            Some('-') => "(-)",
+            Some('.') => "(.)",
+            _ => "",
         };
-        out.push(region);
-    }
-    Ok(out)
-}
-
-enum SvMode {
-    Range {
-        start_left_idx: usize,
-        end_left_idx: usize,
-        start_right_idx: usize,
-        end_right_idx: usize,
-    },
-    Position {
-        pos_left_idx: usize,
-        pos_right_idx: usize,
-    },
-}
-
-/// Parse a CSV/TSV SV table with named columns.
-fn parse_regions_sv_table(path: &Path, flank: Option<u64>) -> Result<Vec<Region>> {
-    let delim = detect_delimiter(path);
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .delimiter(delim)
-        .from_path(path)
-        .with_context(|| format!("Cannot open SV table: {}", path.display()))?;
-
-    let headers = rdr.headers()?.clone();
-    let hmap = build_header_map(&headers);
-
-    let chrom_left_idx = require_column(&hmap, "CHROM_LEFT", &headers)?;
-    let chrom_right_idx = require_column(&hmap, "CHROM_RIGHT", &headers)?;
-    let name_idx = hmap.get("NAME").copied();
-
-    let has_sl = hmap.get("START_LEFT").copied();
-    let has_el = hmap.get("END_LEFT").copied();
-    let has_sr = hmap.get("START_RIGHT").copied();
-    let has_er = hmap.get("END_RIGHT").copied();
-    let has_pl = hmap.get("POS_LEFT").copied();
-    let has_pr = hmap.get("POS_RIGHT").copied();
-
-    let mode = match (has_sl, has_el, has_sr, has_er, has_pl, has_pr) {
-        (Some(sl), Some(el), Some(sr), Some(er), _, _) => SvMode::Range {
-            start_left_idx: sl,
-            end_left_idx: el,
-            start_right_idx: sr,
-            end_right_idx: er,
-        },
-        (None, None, None, None, Some(pl), Some(pr)) => SvMode::Position {
-            pos_left_idx: pl,
-            pos_right_idx: pr,
-        },
-        _ => {
-            return Err(anyhow!(
-                "SV table must have START_LEFT+END_LEFT+START_RIGHT+END_RIGHT (range) \
-                 or POS_LEFT+POS_RIGHT (position). Found: {headers:?}"
-            ));
+        match &r.name {
+            Some(name) => format!("{name} {}:{}-{}{suffix}", r.chr, r.start, r.end),
+            None => format!("{}:{}-{}{suffix}", r.chr, r.start, r.end),
         }
-    };
-
-    if matches!(mode, SvMode::Position { .. }) && flank.is_none() {
-        return Err(anyhow!(
-            "--flank is required when SV table uses POS_LEFT/POS_RIGHT (position mode)"
-        ));
-    }
-    let flank = flank.unwrap_or(0);
-
-    let mut out = Vec::new();
-    for (i, rec) in rdr.records().enumerate() {
-        let rec = rec?;
-        let row = i + 2;
-        let chr_left = read_string_field(&rec, chrom_left_idx)?;
-        let chr_right = read_string_field(&rec, chrom_right_idx)?;
-        let name = read_optional_name(&rec, name_idx);
-
-        match &mode {
-            SvMode::Range {
-                start_left_idx,
-                end_left_idx,
-                start_right_idx,
-                end_right_idx,
-            } => {
-                let sl = parse_u64_field(&rec, *start_left_idx, "START_LEFT", row)?;
-                let el = parse_u64_field(&rec, *end_left_idx, "END_LEFT", row)?;
-                let sr = parse_u64_field(&rec, *start_right_idx, "START_RIGHT", row)?;
-                let er = parse_u64_field(&rec, *end_right_idx, "END_RIGHT", row)?;
-                out.push(Region {
-                    name: name.clone(),
-                    chr: chr_left,
-                    start: min(sl, el),
-                    end: max(sl, el),
-                });
-                out.push(Region {
-                    name,
-                    chr: chr_right,
-                    start: min(sr, er),
-                    end: max(sr, er),
-                });
-            }
-            SvMode::Position {
-                pos_left_idx,
-                pos_right_idx,
-            } => {
-                let pl = parse_u64_field(&rec, *pos_left_idx, "POS_LEFT", row)?;
-                let pr = parse_u64_field(&rec, *pos_right_idx, "POS_RIGHT", row)?;
-                out.push(Region {
-                    name: name.clone(),
-                    chr: chr_left,
-                    start: pl.saturating_sub(flank).max(1),
-                    end: pl.saturating_add(flank),
-                });
-                out.push(Region {
-                    name,
-                    chr: chr_right,
-                    start: pr.saturating_sub(flank).max(1),
-                    end: pr.saturating_add(flank),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-// ─── Validation ──────────────────────────────────────────────────────────────
-
-/// Validate that all regions reference known contigs and clamp to contig bounds.
-fn validate_and_clamp_regions(
-    regions: &mut [Region],
-    fai: &HashMap<String, FaiRecord>,
-) -> Result<()> {
-    let mut missing = Vec::new();
-
-    for r in regions.iter_mut() {
-        if let Some(rec) = fai.get(&r.chr) {
-            r.start = r.start.max(1).min(rec.length);
-            r.end = r.end.max(1).min(rec.length);
-            if r.start > r.end {
-                std::mem::swap(&mut r.start, &mut r.end);
-            }
-        } else {
-            missing.push(r.chr.clone());
-        }
-    }
-
-    if !missing.is_empty() {
-        missing.sort();
-        missing.dedup();
-        return Err(anyhow!(
-            "Contigs not found in FASTA/FAI: {}",
-            missing.join(", ")
-        ));
-    }
-    Ok(())
-}
-
-// ─── Output ──────────────────────────────────────────────────────────────────
-
-/// Wrap a sequence string to a fixed line width for FASTA output.
-/// If `width` is 0, the sequence is returned unwrapped.
-fn wrap_fasta(seq: &str, width: usize) -> String {
-    if width == 0 {
-        return seq.to_string();
-    }
-    let mut out = String::with_capacity(seq.len() + seq.len() / width + 1);
-    for (i, chunk) in seq.as_bytes().chunks(width).enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        // SAFETY: input is valid UTF-8 ASCII, so chunks are too.
-        out.push_str(std::str::from_utf8(chunk).unwrap());
-    }
-    out
-}
-
-/// Extract and write all sequences to the requested destination.
-fn write_sequences(
-    fasta_path: &Path,
-    fai_index: &HashMap<String, FaiRecord>,
-    regions: &[Region],
-    output_file: Option<&Path>,
-    output_dir: Option<&Path>,
-    is_sv: bool,
-) -> Result<()> {
-    // Parallel extraction with thread-local file handles.
-    thread_local! {
-        static TL_FILE: RefCell<Option<File>> = const { RefCell::new(None) };
-    }
-    let sequences: Vec<(Region, String)> = regions
-        .par_iter()
-        .map(|r| {
-            TL_FILE.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                if borrow.is_none() {
-                    *borrow =
-                        Some(File::open(fasta_path).with_context(|| {
-                            format!("Cannot open FASTA: {}", fasta_path.display())
-                        })?);
-                }
-                let f = borrow.as_mut().unwrap();
-                let seq = extract_region(f, fai_index, r)?;
-                let header = match &r.name {
-                    Some(name) => format!(">{name} {}:{}-{}", r.chr, r.start, r.end),
-                    None => format!(">{}:{}-{}", r.chr, r.start, r.end),
-                };
-                let fasta_entry = format!("{header}\n{}\n", wrap_fasta(&seq, 60));
-                Ok((r.clone(), fasta_entry))
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    match output_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)?;
-            if is_sv {
-                write_sv_per_file(dir, &sequences)?;
-            } else {
-                write_per_file(dir, &sequences)?;
-            }
-        }
-        None => {
-            let mut writer: Box<dyn Write> = match output_file {
-                Some(p) => Box::new(BufWriter::new(File::create(p)?)),
-                None => Box::new(BufWriter::new(io::stdout())),
-            };
-            for (_, entry) in &sequences {
-                writer.write_all(entry.as_bytes())?;
-            }
-            writer.flush()?;
-        }
-    }
-    Ok(())
-}
-
-/// Write one FASTA file per region.
-fn write_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
-    sequences
-        .par_iter()
-        .try_for_each(|(region, entry)| -> Result<()> {
-            let filename = match &region.name {
-                Some(name) => format!("{name}_{}_{}.fa", region.start, region.end),
-                None => format!("{}_{}_{}.fa", region.chr, region.start, region.end),
-            };
-            let mut f = File::create(dir.join(filename))?;
-            f.write_all(entry.as_bytes())?;
-            Ok(())
-        })
-}
-
-/// Write one FASTA file per SV pair (two regions per file).
-fn write_sv_per_file(dir: &Path, sequences: &[(Region, String)]) -> Result<()> {
-    if !sequences.len().is_multiple_of(2) {
-        return Err(anyhow!(
-            "SV extraction produced {} regions (expected even number for pairs)",
-            sequences.len()
-        ));
-    }
-
-    sequences
-        .chunks(2)
-        .collect::<Vec<_>>()
-        .par_iter()
-        .try_for_each(|pair| -> Result<()> {
-            let (r1, _) = &pair[0];
-            let (r2, _) = &pair[1];
-
-            let filename = match (&r1.name, &r2.name) {
-                (Some(n1), Some(n2)) if n1 == n2 => {
-                    format!(
-                        "{n1}_{}_{}_{}_{}_{}_{}.fa",
-                        r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end
-                    )
-                }
-                (Some(n1), Some(n2)) => {
-                    return Err(anyhow!("Mismatched names in SV pair: '{n1}' vs '{n2}'"));
-                }
-                _ => {
-                    format!(
-                        "{}_{}_{}_{}_{}_{}.fa",
-                        r1.chr, r1.start, r1.end, r2.chr, r2.start, r2.end
-                    )
-                }
-            };
-
-            let mut f = File::create(dir.join(filename))?;
-            for (_, entry) in pair.iter() {
-                f.write_all(entry.as_bytes())?;
-            }
-            Ok(())
-        })
-}
-
-// ─── Unit tests ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── parse_region_str ─────────────────────────────────────────────────
-
-    #[test]
-    fn parse_region_str_range() {
-        let r = parse_region_str("chr1:100-200", None).unwrap();
-        assert_eq!(r.chr, "chr1");
-        assert_eq!(r.start, 100);
-        assert_eq!(r.end, 200);
-        assert!(r.name.is_none());
-    }
-
-    #[test]
-    fn parse_region_str_swapped() {
-        let r = parse_region_str("chr1:200-100", None).unwrap();
-        assert_eq!(r.start, 100);
-        assert_eq!(r.end, 200);
-    }
-
-    #[test]
-    fn parse_region_str_with_commas() {
-        let r = parse_region_str("chr1:1,000-2,000", None).unwrap();
-        assert_eq!(r.start, 1000);
-        assert_eq!(r.end, 2000);
-    }
-
-    #[test]
-    fn parse_region_str_position_flank_inline() {
-        let r = parse_region_str("chr1:1000+500", None).unwrap();
-        assert_eq!(r.chr, "chr1");
-        assert_eq!(r.start, 500);
-        assert_eq!(r.end, 1500);
-    }
-
-    #[test]
-    fn parse_region_str_position_flank_cli_override() {
-        // CLI flank is larger than inline flank, so it wins.
-        let r = parse_region_str("chr1:1000+100", Some(500)).unwrap();
-        assert_eq!(r.start, 500);
-        assert_eq!(r.end, 1500);
-    }
-
-    #[test]
-    fn parse_region_str_position_clamps_to_one() {
-        let r = parse_region_str("chr1:3+10", None).unwrap();
-        assert_eq!(r.start, 1);
-        assert_eq!(r.end, 13);
-    }
-
-    #[test]
-    fn parse_region_str_missing_colon() {
-        assert!(parse_region_str("chr1_100_200", None).is_err());
-    }
-
-    #[test]
-    fn parse_region_str_bad_start() {
-        assert!(parse_region_str("chr1:abc-200", None).is_err());
-    }
-
-    #[test]
-    fn parse_region_str_bad_format() {
-        assert!(parse_region_str("chr1:100", None).is_err());
-    }
-
-    // ── wrap_fasta ───────────────────────────────────────────────────────
-
-    #[test]
-    fn wrap_fasta_normal() {
-        let seq = "A".repeat(120);
-        let wrapped = wrap_fasta(&seq, 60);
-        let lines: Vec<&str> = wrapped.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].len(), 60);
-        assert_eq!(lines[1].len(), 60);
-    }
-
-    #[test]
-    fn wrap_fasta_shorter_than_width() {
-        let wrapped = wrap_fasta("ACGT", 60);
-        assert_eq!(wrapped, "ACGT");
-    }
-
-    #[test]
-    fn wrap_fasta_empty() {
-        let wrapped = wrap_fasta("", 60);
-        assert_eq!(wrapped, "");
-    }
-
-    #[test]
-    fn wrap_fasta_exact_width() {
-        let seq = "A".repeat(60);
-        let wrapped = wrap_fasta(&seq, 60);
-        assert_eq!(wrapped.lines().count(), 1);
-    }
-
-    #[test]
-    fn wrap_fasta_zero_width() {
-        let wrapped = wrap_fasta("ACGTACGT", 0);
-        assert_eq!(wrapped, "ACGTACGT");
-    }
-
-    // ── count_bases ──────────────────────────────────────────────────────
-
-    #[test]
-    fn count_bases_normal() {
-        assert_eq!(count_bases(b"ACGTNN\n"), 6);
-    }
-
-    #[test]
-    fn count_bases_empty() {
-        assert_eq!(count_bases(b""), 0);
-    }
-
-    #[test]
-    fn count_bases_non_alpha() {
-        assert_eq!(count_bases(b"123\n"), 0);
-    }
-
-    #[test]
-    fn count_bases_mixed() {
-        assert_eq!(count_bases(b"AC1GT\r\n"), 4);
-    }
-
-    // ── parse_fasta_header ───────────────────────────────────────────────
-
-    #[test]
-    fn parse_fasta_header_normal() {
-        assert_eq!(parse_fasta_header(">chr1"), "chr1");
-    }
-
-    #[test]
-    fn parse_fasta_header_with_description() {
-        assert_eq!(parse_fasta_header(">chr1 some description"), "chr1");
-    }
-
-    #[test]
-    fn parse_fasta_header_empty() {
-        assert_eq!(parse_fasta_header(">"), "");
-    }
-
-    #[test]
-    fn parse_fasta_header_whitespace_only() {
-        assert_eq!(parse_fasta_header(">  "), "");
-    }
-
-    // ── parse_regions_inline ─────────────────────────────────────────────
-
-    #[test]
-    fn parse_regions_inline_multiple() {
-        let regions = parse_regions_inline("chr1:1-10,chr2:20-30", None).unwrap();
-        assert_eq!(regions.len(), 2);
-        assert_eq!(regions[0].chr, "chr1");
-        assert_eq!(regions[1].chr, "chr2");
-    }
-
-    #[test]
-    fn parse_regions_inline_trailing_comma() {
-        let regions = parse_regions_inline("chr1:1-10,", None).unwrap();
-        assert_eq!(regions.len(), 1);
-    }
-
-    #[test]
-    fn parse_regions_inline_empty() {
-        let regions = parse_regions_inline("", None).unwrap();
-        assert_eq!(regions.len(), 0);
-    }
-
-    // ── detect_delimiter ─────────────────────────────────────────────────
-
-    #[test]
-    fn detect_delimiter_csv() {
-        assert_eq!(detect_delimiter(Path::new("file.csv")), b',');
-    }
-
-    #[test]
-    fn detect_delimiter_tsv() {
-        assert_eq!(detect_delimiter(Path::new("file.tsv")), b'\t');
-    }
-
-    #[test]
-    fn detect_delimiter_tsv_uppercase() {
-        assert_eq!(detect_delimiter(Path::new("file.TSV")), b'\t');
-    }
-
-    #[test]
-    fn detect_delimiter_no_extension() {
-        assert_eq!(detect_delimiter(Path::new("file")), b',');
-    }
-
-    // ── build_header_map ─────────────────────────────────────────────────
-
-    #[test]
-    fn build_header_map_case_insensitive() {
-        let rec = csv::StringRecord::from(vec!["chrom", "Start", "END"]);
-        let map = build_header_map(&rec);
-        assert!(map.contains_key("CHROM"));
-        assert!(map.contains_key("START"));
-        assert!(map.contains_key("END"));
-    }
-
-    #[test]
-    fn build_header_map_trims_whitespace() {
-        let rec = csv::StringRecord::from(vec![" CHROM ", " START"]);
-        let map = build_header_map(&rec);
-        assert!(map.contains_key("CHROM"));
-        assert!(map.contains_key("START"));
-    }
-
-    // ── detect_gzip_and_reject ───────────────────────────────────────────
-
-    #[test]
-    fn detect_gzip_rejects_gzip_file() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), &[0x1f, 0x8b, 0x08, 0x00]).unwrap();
-        assert!(detect_gzip_and_reject(tmp.path()).is_err());
-    }
-
-    #[test]
-    fn detect_gzip_accepts_plain_fasta() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), b">chr1\nACGT\n").unwrap();
-        assert!(detect_gzip_and_reject(tmp.path()).is_ok());
-    }
-
-    #[test]
-    fn detect_gzip_accepts_empty_file() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        // Empty file: read_exact fails, so no rejection.
-        assert!(detect_gzip_and_reject(tmp.path()).is_ok());
-    }
-
-    // ── overflow / saturation ──────────────────────────────────────────
-
-    #[test]
-    fn parse_region_str_large_position_flank_saturates() {
-        // A position near u64::MAX with a flank must saturate to u64::MAX
-        // rather than wrapping around to a small value.
-        let r = parse_region_str(&format!("chr1:{}+100", u64::MAX - 10), None).unwrap();
-        assert_eq!(r.end, u64::MAX, "end should saturate to u64::MAX, not wrap");
-        // start should also saturate sensibly (stay above 1)
-        assert!(r.start >= 1);
     }
 }
