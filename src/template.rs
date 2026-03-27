@@ -37,6 +37,7 @@ mod tests {
             start: 100,
             end: 200,
             strand,
+            alt_info: None,
         }
     }
 
@@ -94,6 +95,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: None,
+            alt_info: None,
         };
         let result = expand_template("{length}", &r, 1);
         assert_eq!(result, "10");

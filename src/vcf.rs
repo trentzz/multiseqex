@@ -107,11 +107,64 @@ pub fn parse_regions_vcf(
                 start: final_start,
                 end: final_end,
                 strand: None,
+                alt_info: None,
             },
             rec,
         ));
     }
     Ok(results)
+}
+
+/// Expand VCF results for `--alt-seq` mode.
+///
+/// For each VCF record, produces one `Region` per ALT allele (splitting
+/// multi-allelic sites on commas). Each region carries an `AltInfo` so the
+/// substitution can be applied after extraction.
+///
+/// When `both` is true, a reference-sequence region (without `AltInfo`) is
+/// emitted before each alt region.
+pub fn expand_vcf_alt_seq(
+    vcf_results: Vec<(Region, VcfRecord)>,
+    both: bool,
+) -> Vec<(Region, VcfRecord)> {
+    use crate::region::AltInfo;
+
+    let mut out = Vec::new();
+    for (region, rec) in vcf_results {
+        let alts: Vec<&str> = rec.alt_allele.split(',').collect();
+        for alt in &alts {
+            let alt = alt.trim();
+            if alt.is_empty() || alt == "." {
+                continue;
+            }
+
+            // Build a VcfRecord for this single ALT allele.
+            let single_rec = VcfRecord {
+                chrom: rec.chrom.clone(),
+                pos: rec.pos,
+                id: rec.id.clone(),
+                ref_allele: rec.ref_allele.clone(),
+                alt_allele: alt.to_string(),
+            };
+
+            if both {
+                // Emit the reference sequence entry first (no AltInfo).
+                let mut ref_region = region.clone();
+                ref_region.alt_info = None;
+                out.push((ref_region, single_rec.clone()));
+            }
+
+            // Emit the alt-seq entry.
+            let mut alt_region = region.clone();
+            alt_region.alt_info = Some(AltInfo {
+                ref_allele: rec.ref_allele.clone(),
+                alt_allele: alt.to_string(),
+                variant_pos: rec.pos,
+            });
+            out.push((alt_region, single_rec));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -209,5 +262,87 @@ mod tests {
         std::io::Write::write_all(&mut tmp.as_file(), b"chr1\t0\trs1\tA\tG\t.\t.\t.\n").unwrap();
         let err = parse_regions_vcf(tmp.path(), None, None, None).unwrap_err();
         assert!(err.to_string().contains("1-based"));
+    }
+
+    #[test]
+    fn expand_alt_seq_single_allele() {
+        let results = vec![(
+            Region {
+                name: Some("rs1".into()),
+                chr: "chr1".into(),
+                start: 90,
+                end: 110,
+                strand: None,
+                alt_info: None,
+            },
+            VcfRecord {
+                chrom: "chr1".into(),
+                pos: 100,
+                id: Some("rs1".into()),
+                ref_allele: "A".into(),
+                alt_allele: "G".into(),
+            },
+        )];
+        let expanded = expand_vcf_alt_seq(results, false);
+        assert_eq!(expanded.len(), 1);
+        assert!(expanded[0].0.alt_info.is_some());
+        let info = expanded[0].0.alt_info.as_ref().unwrap();
+        assert_eq!(info.ref_allele, "A");
+        assert_eq!(info.alt_allele, "G");
+        assert_eq!(info.variant_pos, 100);
+    }
+
+    #[test]
+    fn expand_alt_seq_multi_allelic() {
+        let results = vec![(
+            Region {
+                name: Some("rs1".into()),
+                chr: "chr1".into(),
+                start: 90,
+                end: 110,
+                strand: None,
+                alt_info: None,
+            },
+            VcfRecord {
+                chrom: "chr1".into(),
+                pos: 100,
+                id: Some("rs1".into()),
+                ref_allele: "A".into(),
+                alt_allele: "G,T".into(),
+            },
+        )];
+        let expanded = expand_vcf_alt_seq(results, false);
+        assert_eq!(
+            expanded.len(),
+            2,
+            "multi-allelic should produce two entries"
+        );
+        assert_eq!(expanded[0].0.alt_info.as_ref().unwrap().alt_allele, "G");
+        assert_eq!(expanded[1].0.alt_info.as_ref().unwrap().alt_allele, "T");
+    }
+
+    #[test]
+    fn expand_alt_seq_both_mode() {
+        let results = vec![(
+            Region {
+                name: Some("rs1".into()),
+                chr: "chr1".into(),
+                start: 90,
+                end: 110,
+                strand: None,
+                alt_info: None,
+            },
+            VcfRecord {
+                chrom: "chr1".into(),
+                pos: 100,
+                id: Some("rs1".into()),
+                ref_allele: "A".into(),
+                alt_allele: "G".into(),
+            },
+        )];
+        let expanded = expand_vcf_alt_seq(results, true);
+        assert_eq!(expanded.len(), 2, "both mode should produce ref + alt");
+        assert!(expanded[0].0.alt_info.is_none(), "first entry is ref");
+        assert!(expanded[1].0.alt_info.is_some(), "second entry is alt");
     }
 }

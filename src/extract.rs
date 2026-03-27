@@ -167,6 +167,7 @@ mod tests {
             start: 0,
             end: 5,
             strand: None,
+            alt_info: None,
         };
         let mut f = File::open(tmp.path()).unwrap();
         let err = extract_region(&mut f, &fai, &r).unwrap_err();
@@ -195,6 +196,7 @@ mod tests {
                 start: 1,
                 end: 20,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -202,6 +204,7 @@ mod tests {
                 start: 15,
                 end: 40,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -209,6 +212,7 @@ mod tests {
                 start: 50,
                 end: 80,
                 strand: None,
+                alt_info: None,
             },
         ];
         let mut individual = Vec::new();
@@ -232,6 +236,52 @@ mod tests {
             );
         }
     }
+}
+
+/// Apply an alternate-allele substitution to an extracted reference sequence.
+///
+/// Given the extracted sequence for a region `[region_start..region_end]`,
+/// replaces the REF allele at `variant_pos` with the ALT allele. The
+/// variant position is 1-based genomic coordinates. The replacement is
+/// case-insensitive on the REF match (the extracted sequence is typically
+/// uppercased).
+///
+/// Returns `Err` if the REF allele at the expected offset does not match
+/// the extracted sequence.
+pub fn apply_alt_substitution(
+    seq: &str,
+    region_start: u64,
+    info: &crate::region::AltInfo,
+) -> Result<String> {
+    let offset = (info.variant_pos - region_start) as usize;
+    let ref_len = info.ref_allele.len();
+
+    if offset + ref_len > seq.len() {
+        return Err(anyhow!(
+            "Alt-seq substitution out of bounds: variant at {} with REF len {} \
+             exceeds extracted sequence length {} (region starts at {})",
+            info.variant_pos,
+            ref_len,
+            seq.len(),
+            region_start
+        ));
+    }
+
+    let existing = &seq[offset..offset + ref_len];
+    if !existing.eq_ignore_ascii_case(&info.ref_allele) {
+        return Err(anyhow!(
+            "Alt-seq REF mismatch at position {}: expected '{}', found '{}' in extracted sequence",
+            info.variant_pos,
+            info.ref_allele,
+            existing
+        ));
+    }
+
+    let mut result = String::with_capacity(seq.len() - ref_len + info.alt_allele.len());
+    result.push_str(&seq[..offset]);
+    result.push_str(&info.alt_allele.to_uppercase());
+    result.push_str(&seq[offset + ref_len..]);
+    Ok(result)
 }
 
 /// Reverse complement a DNA sequence, supporting all IUPAC ambiguity codes.
@@ -282,6 +332,68 @@ pub fn reverse_complement(seq: &str) -> String {
     // Safety: the input is valid UTF-8 and our mapping preserves ASCII,
     // so the output is always valid UTF-8.
     String::from_utf8(out).expect("reverse_complement produced invalid UTF-8")
+}
+
+#[cfg(test)]
+mod alt_seq_tests {
+    use super::apply_alt_substitution;
+    use crate::region::AltInfo;
+
+    fn make_info(ref_allele: &str, alt_allele: &str, variant_pos: u64) -> AltInfo {
+        AltInfo {
+            ref_allele: ref_allele.to_string(),
+            alt_allele: alt_allele.to_string(),
+            variant_pos,
+        }
+    }
+
+    #[test]
+    fn snp_substitution() {
+        // Region 2-8, variant at pos 5: AACCCGG -> AACGCGG
+        let info = make_info("C", "G", 5);
+        let result = apply_alt_substitution("AACCCGG", 2, &info).unwrap();
+        assert_eq!(result, "AACGCGG");
+    }
+
+    #[test]
+    fn insertion() {
+        // Region 2-8, variant at pos 5: REF=C, ALT=CTG
+        // AACCCGG -> AAC[CTG]CGG (offset 3, replace 1 char with 3)
+        let info = make_info("C", "CTG", 5);
+        let result = apply_alt_substitution("AACCCGG", 2, &info).unwrap();
+        assert_eq!(result, "AACCTGCGG");
+    }
+
+    #[test]
+    fn deletion() {
+        // Region 2-10, variant at pos 5: REF=CCG, ALT=C
+        // AACCCGGGT -> AAC[C]GGT (offset 3, replace 3 chars with 1)
+        let info = make_info("CCG", "C", 5);
+        let result = apply_alt_substitution("AACCCGGGT", 2, &info).unwrap();
+        assert_eq!(result, "AACCGGT");
+    }
+
+    #[test]
+    fn ref_mismatch_errors() {
+        let info = make_info("T", "G", 5);
+        let err = apply_alt_substitution("AACCCGG", 2, &info).unwrap_err();
+        assert!(err.to_string().contains("REF mismatch"));
+    }
+
+    #[test]
+    fn out_of_bounds_errors() {
+        let info = make_info("CCCCC", "G", 5);
+        let err = apply_alt_substitution("AACCCGG", 2, &info).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn case_insensitive_ref_match() {
+        // Extracted sequence is uppercase, REF in VCF might be lowercase.
+        let info = make_info("c", "G", 5);
+        let result = apply_alt_substitution("AACCCGG", 2, &info).unwrap();
+        assert_eq!(result, "AACGCGG");
+    }
 }
 
 #[cfg(test)]

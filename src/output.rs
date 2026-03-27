@@ -111,6 +111,19 @@ fn format_tab_entry(r: &Region, seq: &str) -> String {
     format!("{}\t{}\t{}\t{}\t{}\n", r.chr, r.start, r.end, name, seq)
 }
 
+/// Apply alt-seq substitution if the region carries `AltInfo`.
+///
+/// Replaces the REF allele at the variant position with the ALT allele.
+/// Must be called before strand/RC processing because genomic coordinates
+/// are forward-strand.
+fn apply_alt_seq(seq: String, r: &Region) -> Result<String> {
+    if let Some(ref info) = r.alt_info {
+        crate::extract::apply_alt_substitution(&seq, r.start, info)
+    } else {
+        Ok(seq)
+    }
+}
+
 /// Apply per-region strand reverse complement and global --rc flag.
 ///
 /// When a region has strand == Some('-'), we reverse-complement it first.
@@ -195,6 +208,7 @@ fn extract_and_format(
         }
         let f = map.get_mut(fasta_path).unwrap();
         let seq = extract_region(f, fai_index, r)?;
+        let seq = apply_alt_seq(seq, r)?;
         let seq = apply_strand_and_rc(seq, r, rc);
         let seq = apply_post_processing(seq, r, config);
         let entry = format_entry_with_config(r, &seq, line_width, index, config);
@@ -380,6 +394,7 @@ fn write_streaming_ordered_single(
             let extracted = extract_bulk_group(f, group, regions)?;
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
+                let seq = apply_alt_seq(seq, r)?;
                 let seq = apply_strand_and_rc(seq, r, rc);
                 let seq = apply_post_processing(seq, r, config);
                 let entry = format_entry_with_config(r, &seq, line_width, orig_idx, config);
@@ -449,6 +464,7 @@ fn write_tab_output(
                 }
                 let f = map.get_mut(fasta_path).unwrap();
                 let seq = extract_region(f, fai_index, r)?;
+                let seq = apply_alt_seq(seq, r)?;
                 let seq = apply_strand_and_rc(seq, r, rc);
                 let seq = apply_post_processing(seq, r, config);
                 let entry = format_tab_entry(r, &seq);
@@ -505,6 +521,7 @@ fn write_tab_output_single(
             let extracted = extract_bulk_group(f, group, regions)?;
             for (orig_idx, seq) in extracted {
                 let r = &regions[orig_idx];
+                let seq = apply_alt_seq(seq, r)?;
                 let seq = apply_strand_and_rc(seq, r, rc);
                 let seq = apply_post_processing(seq, r, config);
                 let entry = format_tab_entry(r, &seq);
@@ -682,6 +699,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: Some('+'),
+            alt_info: None,
         };
         assert_eq!(strand_suffix(&r), "(+)");
     }
@@ -694,6 +712,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: Some('-'),
+            alt_info: None,
         };
         assert_eq!(strand_suffix(&r), "(-)");
     }
@@ -706,6 +725,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: None,
+            alt_info: None,
         };
         assert_eq!(strand_suffix(&r), "");
     }
@@ -719,6 +739,7 @@ mod tests {
             start: 1,
             end: 4,
             strand: Some('-'),
+            alt_info: None,
         };
         assert_eq!(apply_strand_and_rc("ACGT".to_string(), &r, false), "ACGT");
         // ACGT RC = ACGT (palindrome). Use a non-palindrome.
@@ -734,6 +755,7 @@ mod tests {
             start: 1,
             end: 4,
             strand: Some('-'),
+            alt_info: None,
         };
         assert_eq!(apply_strand_and_rc("AAAC".to_string(), &r, true), "AAAC");
     }
@@ -746,6 +768,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: Some('+'),
+            alt_info: None,
         };
         let entry = format_fasta_entry(&r, "AAACCCGGGT", 60);
         assert!(entry.starts_with(">gene1 chr1:1-10(+)\n"));
@@ -759,6 +782,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: None,
+            alt_info: None,
         };
         let entry = format_tab_entry(&r, "AAACCCGGGT");
         assert_eq!(entry, "chr1\t1\t10\tgene1\tAAACCCGGGT\n");
@@ -772,6 +796,7 @@ mod tests {
             start: 1,
             end: 10,
             strand: None,
+            alt_info: None,
         };
         let entry = format_tab_entry(&r, "AAACCCGGGT");
         assert_eq!(entry, "chr1\t1\t10\t.\tAAACCCGGGT\n");
@@ -831,6 +856,7 @@ mod tests {
             start,
             end,
             strand: None,
+            alt_info: None,
         })
         .collect();
         let out_file = tempfile::NamedTempFile::new().unwrap();

@@ -243,6 +243,19 @@ struct Cli {
     /// Requires --tile.
     #[arg(long, requires = "tile")]
     step: Option<u64>,
+
+    // ── Alt-seq flags ─────────────────────────────────────────────────
+    /// Generate alternate-allele sequences. For each VCF record or table
+    /// row, extract the reference context and replace the REF allele with
+    /// the ALT allele. Multi-allelic sites produce one output per ALT
+    /// allele. Requires --vcf or --table with REF/ALT columns.
+    #[arg(long, conflicts_with = "sv_table")]
+    alt_seq: bool,
+
+    /// Output both reference and alternate sequences for each variant.
+    /// Implies --alt-seq.
+    #[arg(long, conflicts_with = "sv_table")]
+    alt_seq_both: bool,
 }
 
 fn main() -> Result<()> {
@@ -332,6 +345,17 @@ fn main() -> Result<()> {
         return Err(anyhow!(
             "--tile cannot be used with --sv-table --output-dir because it breaks \
              the paired region invariant"
+        ));
+    }
+
+    // --alt-seq-both implies --alt-seq.
+    let alt_seq = cli.alt_seq || cli.alt_seq_both;
+    let alt_seq_both = cli.alt_seq_both;
+
+    // --alt-seq requires --vcf or --table.
+    if alt_seq && cli.vcf.is_none() && cli.table.is_none() {
+        return Err(anyhow!(
+            "--alt-seq requires --vcf or --table (with REF/ALT columns)"
         ));
     }
 
@@ -492,13 +516,48 @@ fn main() -> Result<()> {
         )?);
     }
     if let Some(p) = cli.table.as_ref() {
-        regions.extend(parse_regions_table(
-            p,
-            cli.flank,
-            cli.flank_left,
-            cli.flank_right,
-            cli.delimiter.as_deref(),
-        )?);
+        if alt_seq {
+            // Validate and use the alt-seq table parser.
+            multiseqex::table::validate_table_alt_seq(p, cli.delimiter.as_deref())?;
+            let base_idx = regions.len();
+            let table_regions = multiseqex::table::parse_regions_table_alt_seq(
+                p,
+                cli.flank,
+                cli.flank_left,
+                cli.flank_right,
+                cli.delimiter.as_deref(),
+                alt_seq_both,
+            )?;
+            for r in &table_regions {
+                // Pad vcf_descriptions to align with region indices.
+                while vcf_descriptions.len() < base_idx {
+                    vcf_descriptions.push(String::new());
+                }
+                if let Some(ref info) = r.alt_info {
+                    let mut desc = format!("REF={} ALT={}", info.ref_allele, info.alt_allele);
+                    if alt_seq_both {
+                        desc.push_str(" alt_seq");
+                    }
+                    vcf_descriptions.push(desc);
+                } else if alt_seq_both {
+                    // Reference entry in both mode. We don't know the ALT yet
+                    // but next entry will have it. Use a placeholder from the
+                    // next region's alt_info if available.
+                    vcf_descriptions.push("ref_seq".to_string());
+                } else {
+                    vcf_descriptions.push(String::new());
+                }
+            }
+            regions.extend(table_regions);
+        } else {
+            regions.extend(parse_regions_table(
+                p,
+                cli.flank,
+                cli.flank_left,
+                cli.flank_right,
+                cli.delimiter.as_deref(),
+            )?);
+        }
     }
     if let Some(p) = cli.sv_table.as_ref() {
         regions.extend(parse_regions_sv_table(
@@ -513,14 +572,32 @@ fn main() -> Result<()> {
     // --vcf: extract regions from VCF records.
     if let Some(p) = cli.vcf.as_ref() {
         let vcf_results = parse_regions_vcf(p, cli.flank, cli.flank_left, cli.flank_right)?;
+
+        // When --alt-seq is active, expand multi-allelic sites and attach
+        // AltInfo to each region so the output pipeline performs the
+        // substitution.
+        let vcf_results = if alt_seq {
+            multiseqex::vcf::expand_vcf_alt_seq(vcf_results, alt_seq_both)
+        } else {
+            vcf_results
+        };
+
         let base_idx = regions.len();
-        for (region, rec) in vcf_results {
-            regions.push(region);
+        for (region, rec) in &vcf_results {
+            regions.push(region.clone());
             // Pad vcf_descriptions to align with region indices.
             while vcf_descriptions.len() < base_idx {
                 vcf_descriptions.push(String::new());
             }
-            vcf_descriptions.push(multiseqex::vcf::vcf_description(&rec));
+            let mut desc = multiseqex::vcf::vcf_description(rec);
+            if alt_seq_both {
+                if region.alt_info.is_some() {
+                    desc.push_str(" alt_seq");
+                } else {
+                    desc.push_str(" ref_seq");
+                }
+            }
+            vcf_descriptions.push(desc);
         }
     }
 
@@ -555,6 +632,7 @@ fn main() -> Result<()> {
                 start: 1,
                 end: rec.length,
                 strand: None,
+                alt_info: None,
             });
         }
     }
@@ -577,6 +655,7 @@ fn main() -> Result<()> {
                 start: 1,
                 end: rec.length,
                 strand: None,
+                alt_info: None,
             });
         }
     }
@@ -696,6 +775,10 @@ fn main() -> Result<()> {
         };
         for (i, r) in regions.iter().enumerate() {
             let mut seq = extract_region_from_memory(sequences, r)?;
+            // Apply alt-seq substitution if applicable.
+            if let Some(ref info) = r.alt_info {
+                seq = multiseqex::extract::apply_alt_substitution(&seq, r.start, info)?;
+            }
             // Apply strand and RC.
             let strand_rc = r.strand == Some('-');
             if strand_rc ^ cli.reverse_complement {

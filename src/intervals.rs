@@ -226,6 +226,7 @@ mod tests {
             start,
             end,
             strand: None,
+            alt_info: None,
         }
     }
 

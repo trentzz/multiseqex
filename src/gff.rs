@@ -108,6 +108,7 @@ pub fn parse_regions_gff(path: &Path, feature_type: &str) -> Result<Vec<Region>>
             start,
             end,
             strand,
+            alt_info: None,
         });
     }
     Ok(regions)

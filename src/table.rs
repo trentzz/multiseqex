@@ -215,6 +215,7 @@ pub fn parse_regions_table(
                     start: min(s, e),
                     end: max(s, e),
                     strand,
+                    alt_info: None,
                 }
             }
             TableMode::Position { pos_idx } => {
@@ -231,10 +232,139 @@ pub fn parse_regions_table(
                     start: p.saturating_sub(fl).max(1),
                     end: p.saturating_add(fr),
                     strand,
+                    alt_info: None,
                 }
             }
         };
         out.push(region);
+    }
+    Ok(out)
+}
+
+/// Check whether a table has REF and ALT columns and is in POS mode.
+///
+/// Returns `Ok(true)` if REF and ALT columns are present and the table uses
+/// POS mode. Returns `Err` if `--alt-seq` is used but the preconditions are
+/// not met (missing columns or range mode).
+pub fn validate_table_alt_seq(path: &Path, cli_delimiter: Option<&str>) -> Result<bool> {
+    let delim = detect_delimiter(path, cli_delimiter)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .delimiter(delim)
+        .from_path(path)
+        .with_context(|| format!("Cannot open table: {}", path.display()))?;
+
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
+
+    let has_ref = hmap.contains_key("REF");
+    let has_alt = hmap.contains_key("ALT");
+    let has_pos = hmap.contains_key("POS");
+    let has_start = hmap.contains_key("START");
+
+    if !has_ref || !has_alt {
+        return Err(anyhow!(
+            "--alt-seq with --table requires REF and ALT columns in the table header"
+        ));
+    }
+    if !has_pos || has_start {
+        return Err(anyhow!(
+            "--alt-seq with --table requires POS mode (not START/END range mode)"
+        ));
+    }
+    Ok(true)
+}
+
+/// Parse a table with alt-seq support, expanding multi-allelic ALT alleles.
+///
+/// Each row produces one `Region` per ALT allele. When `both` is true, a
+/// reference region (without `AltInfo`) is emitted before each alt region.
+pub fn parse_regions_table_alt_seq(
+    path: &Path,
+    flank: Option<u64>,
+    flank_left: Option<u64>,
+    flank_right: Option<u64>,
+    cli_delimiter: Option<&str>,
+    both: bool,
+) -> Result<Vec<Region>> {
+    use crate::region::AltInfo;
+
+    let delim = detect_delimiter(path, cli_delimiter)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .delimiter(delim)
+        .from_path(path)
+        .with_context(|| format!("Cannot open table: {}", path.display()))?;
+
+    let headers = rdr.headers()?.clone();
+    let hmap = build_header_map(&headers);
+
+    let chrom_idx = require_column(&hmap, "CHROM", &headers)?;
+    let pos_idx = require_column(&hmap, "POS", &headers)?;
+    let ref_idx = require_column(&hmap, "REF", &headers)?;
+    let alt_idx = require_column(&hmap, "ALT", &headers)?;
+    let name_idx = hmap.get("NAME").copied();
+    let strand_idx = hmap.get("STRAND").copied();
+
+    if flank.is_none() && flank_left.is_none() {
+        return Err(anyhow!(
+            "--flank is required when table uses POS column (position mode)"
+        ));
+    }
+    let (fl, fr) = resolve_flanks(flank, flank_left, flank_right);
+
+    let mut out = Vec::new();
+    for (i, rec) in rdr.records().enumerate() {
+        let rec = rec?;
+        let row = i + 2;
+        let chr = read_string_field(&rec, chrom_idx)?;
+        let name = read_optional_name(&rec, name_idx);
+        let strand = read_optional_strand(&rec, strand_idx);
+        let pos = parse_u64_field(&rec, pos_idx, "POS", row)?;
+        if pos == 0 {
+            return Err(anyhow!(
+                "POS must be >= 1 (1-based coordinates) at row {row}"
+            ));
+        }
+        let ref_allele = read_string_field(&rec, ref_idx)?;
+        let alt_field = read_string_field(&rec, alt_idx)?;
+
+        let start = pos.saturating_sub(fl).max(1);
+        let ref_len = ref_allele.len() as u64;
+        let end = pos
+            .saturating_add(ref_len.saturating_sub(1))
+            .saturating_add(fr);
+
+        for alt in alt_field.split(',') {
+            let alt = alt.trim();
+            if alt.is_empty() || alt == "." {
+                continue;
+            }
+
+            if both {
+                out.push(Region {
+                    name: name.clone(),
+                    chr: chr.clone(),
+                    start,
+                    end,
+                    strand,
+                    alt_info: None,
+                });
+            }
+
+            out.push(Region {
+                name: name.clone(),
+                chr: chr.clone(),
+                start,
+                end,
+                strand,
+                alt_info: Some(AltInfo {
+                    ref_allele: ref_allele.clone(),
+                    alt_allele: alt.to_string(),
+                    variant_pos: pos,
+                }),
+            });
+        }
     }
     Ok(out)
 }
@@ -347,6 +477,7 @@ pub fn parse_regions_sv_table(
                     start: min(sl, el),
                     end: max(sl, el),
                     strand,
+                    alt_info: None,
                 });
                 out.push(Region {
                     name,
@@ -354,6 +485,7 @@ pub fn parse_regions_sv_table(
                     start: min(sr, er),
                     end: max(sr, er),
                     strand,
+                    alt_info: None,
                 });
             }
             SvMode::Position {
@@ -376,6 +508,7 @@ pub fn parse_regions_sv_table(
                     start: pl.saturating_sub(fl).max(1),
                     end: pl.saturating_add(fr),
                     strand,
+                    alt_info: None,
                 });
                 out.push(Region {
                     name,
@@ -383,6 +516,7 @@ pub fn parse_regions_sv_table(
                     start: pr.saturating_sub(fl).max(1),
                     end: pr.saturating_add(fr),
                     strand,
+                    alt_info: None,
                 });
             }
         }

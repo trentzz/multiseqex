@@ -179,6 +179,7 @@ mod tests {
             start: 3,
             end: 8,
             strand: None,
+            alt_info: None,
         };
         let seq = extract_region_from_memory(&seqs, &r).unwrap();
         assert_eq!(seq, "GTACGT");
@@ -196,6 +197,7 @@ mod tests {
             start: 2,
             end: 100,
             strand: None,
+            alt_info: None,
         };
         let seq = extract_region_from_memory(&seqs, &r).unwrap();
         assert_eq!(seq, "CGT");
@@ -213,6 +215,7 @@ mod tests {
             start: 1,
             end: 4,
             strand: None,
+            alt_info: None,
         };
         assert!(extract_region_from_memory(&seqs, &r).is_err());
     }

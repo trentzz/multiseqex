@@ -15,18 +15,18 @@ pub mod validate;
 pub mod vcf;
 
 // Convenience re-exports for library consumers.
-pub use extract::{extract_region, reverse_complement};
+pub use extract::{apply_alt_substitution, extract_region, reverse_complement};
 pub use fai::{FaiRecord, build_fai, read_fai};
 pub use gff::parse_regions_gff;
 pub use intervals::{intersect_regions, subtract_regions};
 pub use mask::{MaskIndex, MaskMode};
 pub use output::wrap_fasta;
 pub use region::{
-    Region, deduplicate_regions, merge_regions, parse_region_str, parse_regions_bed,
+    AltInfo, Region, deduplicate_regions, merge_regions, parse_region_str, parse_regions_bed,
     resolve_flanks, sort_regions, tile_regions,
 };
 pub use stats::{RegionStats, compute_stats};
 pub use template::expand_template;
 pub use transform::TransformConfig;
 pub use validate::{is_gzip, resolve_bgzip};
-pub use vcf::{VcfRecord, parse_regions_vcf};
+pub use vcf::{VcfRecord, expand_vcf_alt_seq, parse_regions_vcf};

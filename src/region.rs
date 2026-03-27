@@ -4,6 +4,21 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+/// Information needed to produce an alternate-allele sequence.
+///
+/// Stored on a `Region` when `--alt-seq` is active. After the reference
+/// sequence is extracted, the bases at the variant position are replaced
+/// with `alt_allele`.
+#[derive(Debug, Clone)]
+pub struct AltInfo {
+    /// REF allele from VCF or table.
+    pub ref_allele: String,
+    /// ALT allele (single allele; multi-allelic sites are split beforehand).
+    pub alt_allele: String,
+    /// 1-based genomic position of the variant (VCF POS).
+    pub variant_pos: u64,
+}
+
 /// A genomic interval (1-based, inclusive on both ends).
 #[derive(Debug, Clone)]
 pub struct Region {
@@ -13,6 +28,9 @@ pub struct Region {
     pub end: u64,
     /// Per-region strand: '+', '-', or '.' (unstranded). None means unspecified.
     pub strand: Option<char>,
+    /// When `--alt-seq` is active, carries the REF/ALT/POS needed to build
+    /// the alternate-allele sequence after extraction.
+    pub alt_info: Option<AltInfo>,
 }
 
 /// Parse comma-separated inline region strings.
@@ -103,6 +121,7 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
             start: min(start, end),
             end: max(start, end),
             strand: None,
+            alt_info: None,
         });
     }
 
@@ -127,6 +146,7 @@ pub fn parse_region_str(s: &str, flank: Option<u64>) -> Result<Region> {
         start: pos.saturating_sub(effective_flank).max(1),
         end: pos.saturating_add(effective_flank),
         strand: None,
+        alt_info: None,
     })
 }
 
@@ -234,6 +254,7 @@ pub fn parse_regions_bed(
             start: final_start,
             end: final_end,
             strand,
+            alt_info: None,
         });
     }
     Ok(regions)
@@ -363,6 +384,7 @@ pub fn tile_regions(regions: &[Region], tile_size: u64, step: u64) -> Vec<Region
                 start: tile_start,
                 end: tile_end,
                 strand: r.strand,
+                alt_info: None,
             });
             offset += step;
         }
@@ -507,6 +529,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: Some("foo".into()),
@@ -514,6 +537,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -521,6 +545,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
@@ -539,6 +564,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -546,6 +572,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
         ];
         let removed = deduplicate_regions(&mut regions);
@@ -629,6 +656,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -636,6 +664,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -643,6 +672,7 @@ mod tests {
                 start: 20,
                 end: 30,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -650,6 +680,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
         ];
         sort_regions(&mut regions);
@@ -726,6 +757,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -733,6 +765,7 @@ mod tests {
                 start: 5,
                 end: 15,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -740,6 +773,7 @@ mod tests {
                 start: 20,
                 end: 30,
                 strand: None,
+                alt_info: None,
             },
         ];
         merge_regions(&mut regions, 0);
@@ -759,6 +793,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -766,6 +801,7 @@ mod tests {
                 start: 15,
                 end: 20,
                 strand: None,
+                alt_info: None,
             },
         ];
         merge_regions(&mut regions, 5);
@@ -783,6 +819,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -790,6 +827,7 @@ mod tests {
                 start: 5,
                 end: 15,
                 strand: None,
+                alt_info: None,
             },
         ];
         merge_regions(&mut regions, 0);
@@ -805,6 +843,7 @@ mod tests {
                 start: 1,
                 end: 10,
                 strand: None,
+                alt_info: None,
             },
             Region {
                 name: None,
@@ -812,6 +851,7 @@ mod tests {
                 start: 10,
                 end: 20,
                 strand: None,
+                alt_info: None,
             },
         ];
         merge_regions(&mut regions, 0);
@@ -830,6 +870,7 @@ mod tests {
             start: 100,
             end: 199,
             strand: None,
+            alt_info: None,
         }];
         let tiled = tile_regions(&regions, 50, 50);
         assert_eq!(tiled.len(), 2);
@@ -847,6 +888,7 @@ mod tests {
             start: 100,
             end: 200,
             strand: None,
+            alt_info: None,
         }];
         let tiled = tile_regions(&regions, 50, 25);
         // Region is 101 bases (100..=200). Tiles at offsets 0,25,50,75,100:
@@ -872,6 +914,7 @@ mod tests {
             start: 1,
             end: 20,
             strand: Some('-'),
+            alt_info: None,
         }];
         let tiled = tile_regions(&regions, 10, 10);
         assert_eq!(tiled.len(), 2);
@@ -888,6 +931,7 @@ mod tests {
             start: 50,
             end: 50,
             strand: None,
+            alt_info: None,
         }];
         let tiled = tile_regions(&regions, 10, 10);
         assert_eq!(tiled.len(), 1);
@@ -903,6 +947,7 @@ mod tests {
             start: 1,
             end: 5,
             strand: None,
+            alt_info: None,
         }];
         let tiled = tile_regions(&regions, 50, 50);
         assert_eq!(tiled.len(), 1);

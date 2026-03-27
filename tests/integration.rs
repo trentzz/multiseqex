@@ -2548,3 +2548,173 @@ fn tile_with_no_index() {
         .stdout(predicate::str::contains("_tile1"))
         .stdout(predicate::str::contains("_tile2"));
 }
+
+// ─── --alt-seq (alternate allele sequence generation) ────────────────────────
+
+#[test]
+fn alt_seq_vcf_snp() {
+    // chr1 pos 5 = C (AAACCCGGGT...), flank=3 -> region 2-8 = AACCCGG
+    // REF=C ALT=G -> AACGCGG
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            &fixture("variants.vcf"),
+            "--flank",
+            "3",
+            "--alt-seq",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AACGCGG"));
+}
+
+#[test]
+fn alt_seq_vcf_deletion() {
+    // del1: chr1 pos 10, REF=TTT, ALT=T
+    // ref region spans pos 10-12, flank=3 -> region 7-15
+    // chr1 pos 7-15: GGGTTTAAA
+    // Replace TTT at offset 3 with T -> GGGTAAA
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            &fixture("variants.vcf"),
+            "--flank",
+            "3",
+            "--alt-seq",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("GGGTAAA"),
+        "Expected deletion output GGGTAAA, got: {stdout}"
+    );
+}
+
+#[test]
+fn alt_seq_vcf_both() {
+    // With --alt-seq-both, we get both ref and alt sequences.
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            &fixture("variants.vcf"),
+            "--flank",
+            "3",
+            "--alt-seq-both",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ref_seq"))
+        .stdout(predicate::str::contains("alt_seq"));
+}
+
+#[test]
+fn alt_seq_multi_allelic_produces_multiple_outputs() {
+    // chr2 pos 5 = T, REF=T ALT=G,C -> two alt-seq outputs
+    // flank=3 -> region 2-8 = TTTTTTT (chr2: TTTTTTTTTTGGG...)
+    // Actually chr2 pos 1-10: TTTTTTTTTT
+    // pos 5 = T, REF=T, ALT=G,C
+    // region 2-8: TTTTTTT
+    // ALT=G: TTTGTTT
+    // ALT=C: TTTCTTT
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            &fixture("variants.vcf"),
+            "--flank",
+            "3",
+            "--alt-seq",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Count how many times ALT= appears for multi1
+    let g_count = stdout.matches("TTTGTTT").count();
+    let c_count = stdout.matches("TTTCTTT").count();
+    assert!(g_count >= 1, "Expected ALT=G output, got: {stdout}");
+    assert!(c_count >= 1, "Expected ALT=C output, got: {stdout}");
+}
+
+#[test]
+fn alt_seq_table_with_ref_alt_columns() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--table",
+            &fixture("table_alt.csv"),
+            "--flank",
+            "3",
+            "--alt-seq",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AACGCGG")); // chr1 pos 5 C->G
+}
+
+#[test]
+fn alt_seq_table_multi_allelic() {
+    let output = cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--table",
+            &fixture("table_alt.csv"),
+            "--flank",
+            "3",
+            "--alt-seq",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // multi1: chr2 pos 5 T->G,C
+    assert!(
+        stdout.contains("TTTGTTT"),
+        "Expected ALT=G output for multi1"
+    );
+    assert!(
+        stdout.contains("TTTCTTT"),
+        "Expected ALT=C output for multi1"
+    );
+}
+
+#[test]
+fn alt_seq_without_vcf_or_table_errors() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--regions", "chr1:1-10", "--alt-seq"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--alt-seq requires --vcf or --table",
+        ));
+}
+
+#[test]
+fn alt_seq_conflicts_with_sv_table() {
+    cmd()
+        .arg(fixture("test.fa"))
+        .args(["--sv-table", &fixture("sv_table_range.tsv"), "--alt-seq"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn alt_seq_both_implies_alt_seq() {
+    // --alt-seq-both without explicit --alt-seq should still work (implies it).
+    cmd()
+        .arg(fixture("test.fa"))
+        .args([
+            "--vcf",
+            &fixture("variants.vcf"),
+            "--flank",
+            "3",
+            "--alt-seq-both",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ref_seq"))
+        .stdout(predicate::str::contains("alt_seq"));
+}
