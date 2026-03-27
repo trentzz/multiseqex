@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-03-28
+
+### Added
+
+- **Alternate allele sequences** (`--alt-seq`, `--alt-seq-both`): generate
+  sequences with the ALT allele substituted in place of REF. Works with `--vcf`
+  and `--table` (requires REF/ALT columns). Multi-allelic sites produce one
+  output per ALT allele. `--alt-seq-both` outputs both the reference and
+  alternate sequences for each variant.
+
+### Fixed
+
+- Removed security audit CI job that was failing with "Resource not accessible
+  by integration".
+
 ## [0.2.0] - 2026-03-27
 
 ### Added
@@ -143,5 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Case-insensitive column name matching.
 - Optional `NAME` column for custom output naming.
 
+[0.2.1]: https://github.com/trentzz/multiseqex/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/trentzz/multiseqex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/trentzz/multiseqex/releases/tag/v0.1.0

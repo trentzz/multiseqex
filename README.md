@@ -55,6 +55,12 @@ multiseqex ref.fa --vcf variants.vcf --flank 100 -o out.fa
 # GFF gene extraction
 multiseqex ref.fa --gff annotations.gff3 --gff-feature gene -o genes.fa
 
+# VCF alternate allele sequences with flanking context
+multiseqex ref.fa --vcf variants.vcf --flank 100 --alt-seq -o alt.fa
+
+# Both reference and alternate sequences
+multiseqex ref.fa --vcf variants.vcf --flank 100 --alt-seq-both -o both.fa
+
 # Region statistics (GC%, length, masking)
 multiseqex ref.fa --bed regions.bed --stats
 
@@ -79,6 +85,8 @@ multiseqex ref.fa --bed regions.bed --tile 100 --step 50 -o tiles.fa
 | `--sv-table` | SV paired-region table. Columns: CHROM_LEFT/RIGHT, START/END_LEFT/RIGHT or POS_LEFT/RIGHT. |
 | `--vcf` | VCF file. Extracts REF span per record. ID used as name; REF/ALT in header. |
 | `--gff` | GFF3/GTF annotation file. Use `--gff-feature` to filter (default: `gene`). |
+| `--alt-seq` | Generate alternate-allele sequences. Requires `--vcf` or `--table` with REF/ALT columns. |
+| `--alt-seq-both` | Output both reference and alternate sequences. Implies `--alt-seq`. |
 | `--contigs` | Comma-separated contig names to extract in full. |
 | `--contig-list` | File with one contig name per line to extract in full. |
 
@@ -169,7 +177,7 @@ See the [docs/](docs/) folder for detailed guides:
 
 ## Version
 
-Current release: **0.2.0**
+Current release: **0.2.1**
 MSRV: **1.87** (Rust edition 2024)
 
 ## Licence

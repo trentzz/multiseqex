@@ -373,6 +373,66 @@ multiseqex ref.fa --bed regions.bed --mask-bed repeats.bed --soft-mask -o out.fa
 `--hard-mask` is the default when `--mask-bed` is given. Use `--soft-mask` for
 lowercase masking instead.
 
+## Alternate allele sequences (`--alt-seq`, `--alt-seq-both`)
+
+These flags generate sequences where the REF allele is replaced with the ALT
+allele, producing variant-modified output.
+
+### With `--vcf`
+
+Each VCF record's reference context is extracted (optionally with `--flank`),
+then the REF bases are replaced by the ALT allele:
+
+```bash
+# SNP: REF=C ALT=G at chr1:5 with 3bp flanking
+# Reference context: AACCCGG -> Alternate: AACGCGG
+multiseqex ref.fa --vcf variants.vcf --flank 3 --alt-seq -o alt.fa
+```
+
+### With `--table`
+
+The table must contain `REF` and `ALT` columns alongside `CHROM` and `POS`.
+Position mode with `--flank` is required:
+
+```bash
+multiseqex ref.fa --table variants.csv --flank 3 --alt-seq -o alt.fa
+```
+
+### Both reference and alternate (`--alt-seq-both`)
+
+`--alt-seq-both` implies `--alt-seq`. For each variant, two entries are emitted:
+the unmodified reference sequence (tagged `ref_seq` in the header) followed by
+the alternate sequence (tagged `alt_seq`):
+
+```bash
+multiseqex ref.fa --vcf variants.vcf --flank 100 --alt-seq-both -o both.fa
+```
+
+### Multi-allelic sites
+
+When a VCF record or table row has a comma-separated ALT field (e.g. `G,C`),
+each alternative allele produces a separate output entry:
+
+```bash
+# REF=T ALT=G,C -> two output sequences, one for each ALT
+multiseqex ref.fa --vcf multi.vcf --flank 3 --alt-seq -o multi_alt.fa
+```
+
+### Variant types
+
+- **SNP**: single-base replacement. Output length equals the reference context
+  length.
+- **Insertion**: ALT is longer than REF. Output is longer than the reference
+  context.
+- **Deletion**: ALT is shorter than REF. Output is shorter than the reference
+  context.
+
+### Constraints
+
+- `--alt-seq` requires `--vcf` or `--table` (with REF/ALT columns). Using it
+  with `--regions`, `--bed`, or other input sources alone produces an error.
+- `--alt-seq` and `--alt-seq-both` conflict with `--sv-table`.
+
 ## Combining input sources
 
 Most input flags can be combined freely. All regions from every source are
